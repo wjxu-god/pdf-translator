@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+build/
+dist/*
+!dist/PDF保排版翻译.exe
+*.spec
+译文输出/
+_uploads/
+pdf工具.log
+历史记录.json
+shim_requests.log
+*.bak
+*.bak-*
+.DS_Store
+设置.json
