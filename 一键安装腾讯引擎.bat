@@ -1,21 +1,36 @@
 @echo off
-chcp 65001 >nul
-title å®‰è£…è…¾è®¯å…è´¹ç¿»è¯‘å¼•æ“
+setlocal
+title °²×°ÌÚÑ¶Ãâ·Ñ·­ÒëÒıÇæ
 cd /d "%~dp0"
 
 set "HOME_DIR=%PDF2ZH_HOME%"
-if "%HOME_DIR%"=="" if exist "D:\PDF_Translator\env\python.exe" set "HOME_DIR=D:\PDF_Translator"
-if "%HOME_DIR%"=="" (
-  echo æœªæ‰¾åˆ° BabelDOC è¿è¡Œç¯å¢ƒã€‚
-  echo è¯·å…ˆå®‰è£… pdf2zh_nextï¼Œæˆ–è®¾ç½®ç¯å¢ƒå˜é‡ PDF2ZH_HOME æŒ‡å‘å®‰è£…ç›®å½•ã€‚
-  echo.
-  echo æç¤ºï¼šä¸è£…ä¹Ÿèƒ½ç”¨æœ¬è½¯ä»¶ï¼Œåªæ˜¯åªæœ‰ã€Œæœ¬åœ°å¼•æ“ã€å¯ç”¨ã€‚
-  pause
-  exit /b 1
-)
+if defined HOME_DIR if not exist "%HOME_DIR%\env\python.exe" set "HOME_DIR="
+if not defined HOME_DIR if exist "D:\PDF_Translator\env\python.exe" set "HOME_DIR=D:\PDF_Translator"
+if not defined HOME_DIR goto nohome
 
-echo ä½¿ç”¨ç¯å¢ƒï¼š%HOME_DIR%
-"%HOME_DIR%\env\python.exe" "install_tencent_free.py"
+echo [1/2] ÔËĞĞ»·¾³: %HOME_DIR%
+echo [2/2] ÕıÔÚ°²×°ÌÚÑ¶Ãâ·Ñ·­ÒëÒıÇæ...
 echo.
-echo å®Œæˆã€‚å‘½ä»¤è¡Œå¯ç”¨ï¼špdf2zh_next è¾“å…¥.pdf --tencentfree --lang-in en --lang-out zh
+"%HOME_DIR%\env\python.exe" "%~dp0install_tencent_free.py"
+if errorlevel 1 goto failed
+echo.
+echo °²×°Íê³É¡£½çÃæÀï¿ÉÑ¡¡¸BabelDOC + ÌÚÑ¶¡¹£¬ÃüÁîĞĞ¿ÉÓÃ:
+echo    pdf2zh_next ÊäÈë.pdf --tencentfree --lang-in en --lang-out zh
+echo.
 pause
+exit /b 0
+
+:nohome
+echo Î´ÕÒµ½ BabelDOC ÔËĞĞ»·¾³£¨pdf2zh_next£©¡£
+echo.
+echo ÌáÊ¾: ²»×° BabelDOC Ò²ÄÜÓÃ±¾Èí¼ş£¬Ö»ÊÇÖ»ÄÜÓÃ¡¸±¾µØÒıÇæ¡¹¡£
+echo ÏëÓÃ¸üºÃµÄÅÅ°æ£¬ÇëÏÈ°²×° pdf2zh_next£¬ÔÙÉèÖÃ»·¾³±äÁ¿ PDF2ZH_HOME¡£
+echo.
+pause
+exit /b 1
+
+:failed
+echo.
+echo °²×°Ê§°Ü£¬Çë²é¿´ÉÏÃæµÄ´íÎóĞÅÏ¢¡£
+pause
+exit /b 1

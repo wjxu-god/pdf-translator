@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""给 pdf2zh_next 增加「腾讯免费翻译」引擎（TencentFree）
+r"""给 pdf2zh_next 增加「腾讯免费翻译」引擎（TencentFree）
 幂等：已安装则跳过；改动前自动备份
 用法： D:\PDF_Translator\env\python.exe install_tencent_free.py
 """
