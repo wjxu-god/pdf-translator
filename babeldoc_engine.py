@@ -8,19 +8,50 @@ def _find_root():
     env = os.environ.get("PDF2ZH_HOME")
     if env:
         cands.append(env)
-    cands += [r"D:\PDF_Translator", os.path.join(os.path.expanduser("~"), "PDF_Translator"),
+    local = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    cands += [os.environ.get("PDFTRANS_BABELDOC_DIR") or "",
+              os.path.join(local, "PDF翻译专家", "babeldoc"),
+              r"D:\PDF_Translator",
+              os.path.join(os.path.expanduser("~"), "PDF_Translator"),
               "/opt/PDF_Translator"]
+    def _ok(c):
+        if not c:
+            return False
+        return (os.path.exists(os.path.join(c, "env", "python.exe"))
+                or os.path.exists(os.path.join(c, "env", "Scripts", "python.exe"))
+                or os.path.exists(os.path.join(c, "env", "bin", "python")))
     for c in cands:
-        if c and os.path.exists(os.path.join(c, "env", "python.exe")) or \
-           (c and os.path.exists(os.path.join(c, "env", "bin", "python"))):
+        if _ok(c):
             return c
     return cands[0]
 
 ROOT = _find_root()
-PY = os.path.join(ROOT, "env", "python.exe")
-if not os.path.exists(PY):
-    PY = os.path.join(ROOT, "env", "bin", "python")
-CFG = os.path.join(ROOT, "app", "config", "config.toml")
+
+def _pick_python(root):
+    for rel in (("env", "Scripts", "python.exe"), ("env", "python.exe"), ("env", "bin", "python")):
+        p = os.path.join(root, *rel)
+        if os.path.exists(p):
+            return p
+    return os.path.join(root, "env", "Scripts", "python.exe")
+
+def _pick_config(root):
+    for rel in (("app", "config", "config.toml"), ("config", "config.toml")):
+        p = os.path.join(root, *rel)
+        if os.path.exists(p):
+            return p
+    return ""
+
+PY = _pick_python(ROOT)
+CFG = _pick_config(ROOT)
+
+
+def _workdir():
+    """BabelDOC 运行目录：整合包有 app/，软件内自装的环境没有。"""
+    for rel in ("app", "."):
+        p = os.path.normpath(os.path.join(ROOT, rel))
+        if os.path.isdir(p):
+            return p
+    return ROOT
 
 STAGE_HINTS = [
     ("Parse PDF", "解析 PDF", 6), ("Parse Page Layout", "版面分析", 18),
@@ -96,7 +127,7 @@ def ensure_shim(log=print):
     return os.path.exists(PY) and os.path.exists(CFG)
 
 def available():
-    return os.path.exists(PY) and os.path.exists(CFG)
+    return os.path.exists(PY)
 
 SHIM_URL = "http://127.0.0.1:8921/v1"
 SERVICE_FLAGS = {"tencentfree": ["--tencentfree"],
@@ -117,7 +148,7 @@ def translate(src_pdf, out_dir, src="en", tgt="zh", base_name=None, log=print, p
     cmd = [PY, "-u", "-c", "from pdf2zh_next.main import cli; cli()",
            src_pdf, "--output", tmp,
            "--lang-in", src, "--lang-out", tgt,
-           "--config-file", CFG] + SERVICE_FLAGS.get(service, ["--bing"])
+           ] + (["--config-file", CFG] if CFG else []) + SERVICE_FLAGS.get(service, ["--bing"])
     log("  babeldoc start: %s (service=%s)" % (os.path.basename(src_pdf), service))
     env = dict(os.environ)
     env["NO_COLOR"] = "1"
@@ -130,7 +161,7 @@ def translate(src_pdf, out_dir, src="en", tgt="zh", base_name=None, log=print, p
         flags = 0
         if os.name == "nt":
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        proc = subprocess.Popen(cmd, cwd=os.path.join(ROOT, "app"),
+        proc = subprocess.Popen(cmd, cwd=_workdir(),
                                 stdout=fh, stderr=subprocess.STDOUT, env=env,
                                 creationflags=flags)
         pos = 0

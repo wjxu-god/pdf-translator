@@ -14,6 +14,9 @@ PY_EMBED_URL = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd
 GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
 
 def base_dir():
+    custom = (os.environ.get("PDFTRANS_BABELDOC_DIR") or "").strip()
+    if custom:
+        return custom
     root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     return os.path.join(root, APP_DIR_NAME, "babeldoc")
 
