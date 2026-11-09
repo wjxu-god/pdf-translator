@@ -22,7 +22,7 @@ JOBS = {}
 HISTORY = os.path.join(HERE, "历史记录.json")
 SETTINGS = os.path.join(HERE, "设置.json")
 APP_NAME = "PDF翻译专家"
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 
 def load_settings():
     try:
@@ -62,12 +62,10 @@ def outdir():
     return fb
 
 ENGINES = [
-    ("auto",            "自动（推荐）",        "Bing → 腾讯 → Google → 本地"),
-    ("babeldoc_tencent","BabelDOC + 腾讯",     "免费无 Key，国内网络可用"),
-    ("babeldoc_bing",   "BabelDOC + Bing",     "速度快"),
-    ("babeldoc_google", "BabelDOC + Google",   "备用通道"),
-    ("babeldoc_llm",    "BabelDOC + 大模型",   "质量高，较慢"),
-    ("local",           "本地引擎",            "零依赖兜底"),
+    ("auto",            "自动（推荐）",    "先 Bing，失败换腾讯，再不行用本地"),
+    ("babeldoc_tencent","BabelDOC + 腾讯", "免费无 Key，国内网络可用"),
+    ("babeldoc_bing",   "BabelDOC + Bing", "速度快"),
+    ("local",           "本地引擎",        "零依赖兜底"),
 ]
 
 def log(msg):
@@ -132,6 +130,41 @@ def babeldoc_ready(force=False):
             ok = False
     _BABEL_CACHE.update({"t": now, "v": ok})
     return ok
+
+def _make_probe_pdf(path):
+    """生成一页极简英文 PDF，用于自检 / 模型预热。"""
+    import pymupdf
+    d = pymupdf.open()
+    p = d.new_page(width=420, height=260)
+    p.insert_text((40, 80), "This is a translation test.", fontsize=16, fontname="helv")
+    p.insert_text((40, 120), "Graph randomization is a useful tool.", fontsize=12, fontname="helv")
+    d.save(path)
+    d.close()
+    return path
+
+def selftest(service="bing"):
+    """真跑一遍 BabelDOC：生成探针 PDF → 翻译 → 报告结果与真实报错。"""
+    import tempfile, glob as _glob
+    out = {"ok": False, "service": service, "steps": []}
+
+    def step(name, ok, detail=""):
+        out["steps"].append({"name": name, "ok": bool(ok), "detail": str(detail)[:800]})
+
+    try:
+        import pdf_engine_babeldoc as be
+        step("适配器可用", be.available(), "ROOT=%s" % be.ROOT)
+        tmpd = tempfile.mkdtemp(prefix="selftest_")
+        src = _make_probe_pdf(os.path.join(tmpd, "probe.pdf"))
+        step("探针 PDF 生成", os.path.exists(src), src)
+        res = be.translate(src, tmpd, "en", "zh", "probe",
+                           log=lambda m: out["steps"].append({"name": "log", "ok": True, "detail": str(m)[:300]}),
+                           service=service)
+        step("翻译成功", True, "输出：%s" % os.path.basename(res["mono"]))
+        out["ok"] = True
+        out["out"] = res["mono"]
+    except Exception as e:
+        step("翻译失败", False, repr(e)[:800])
+    return out
 
 def diagnose():
     """产品诊断：把引擎链路每一环的真实状态都跑一遍，供用户/开发者定位问题。"""
@@ -264,7 +297,7 @@ def run_job(job_id, name, raw, src, tgt, engine):
         explicit = engine.startswith("babeldoc")
         chain = []
         if engine == "auto":
-            chain = ["bing", "tencentfree", "google"]
+            chain = ["bing", "tencentfree"]
             try:
                 import engine_manager as _em3
                 if not _em3.has_tencent():
@@ -272,8 +305,8 @@ def run_job(job_id, name, raw, src, tgt, engine):
             except Exception:
                 chain = [c for c in chain if c != "tencentfree"]
         elif explicit:
-            chain = [{"babeldoc_bing": "bing", "babeldoc_tencent": "tencentfree",
-                      "babeldoc_google": "google", "babeldoc_llm": "siliconflowfree"}.get(engine, "bing")]
+            chain = [{"babeldoc_bing": "bing",
+                      "babeldoc_tencent": "tencentfree"}.get(engine, "bing")]
         if chain:
             if not babeldoc_ready(force=True):
                 if explicit:
@@ -440,6 +473,7 @@ button.danger:hover{background:#3d1e2b;border-color:#ff6b8b}
             <button class="btn" id="btnTc" onclick="installEngine('tencent')">装腾讯引擎</button>
             <button class="btn" onclick="changeEngineDir()">更改位置</button>
             <button class="btn" onclick="diagnose()">诊断</button>
+            <button class="btn" onclick="selftest()">试翻自检</button>
             <button class="btn danger" onclick="installEngine('uninstall')">卸载</button>
           </div>
         </div>
@@ -565,6 +599,21 @@ function saveLog(){
     body:JSON.stringify({text:t})}).then(r=>r.json()).then(j=>{
       toast(j.path?('已保存：'+j.path):'保存失败');
     }).catch(()=>toast('保存失败'));
+}
+function selftest(){
+  const logEl=document.getElementById('engLog');
+  logEl.style.display='block';
+  logEl.textContent='正在试翻（首次会下载约 50MB 版面模型，可能需要几分钟）…';
+  const svc = (document.getElementById('engine').value==='babeldoc_tencent') ? 'tencentfree' : 'bing';
+  fetch('/selftest?service='+svc).then(r=>r.json()).then(d=>{
+    const lines=[];
+    (d.steps||[]).forEach(c=>{
+      lines.push((c.ok?'[OK]  ':'[失败] ')+c.name);
+      if(c.detail) lines.push('        '+String(c.detail));
+    });
+    lines.push('', d.ok ? '结论：引擎可以正常翻译' : '结论：引擎不可用，请把这段日志发给我');
+    logEl.textContent=lines.join('\n');
+  }).catch(e=>{ logEl.textContent='自检失败: '+e; });
 }
 function diagnose(){
   const logEl=document.getElementById('engLog');
@@ -701,6 +750,10 @@ class H(BaseHTTPRequestHandler):
             q = urllib.parse.parse_qs(u.query)
             jid = (q.get("id") or [""])[0]
             return self._send(200, json.dumps(JOBS.get(jid, {"stage": "unknown"}), ensure_ascii=False))
+        if u.path == "/selftest":
+            q = urllib.parse.parse_qs(u.query)
+            svc = (q.get("service") or ["bing"])[0]
+            return self._send(200, json.dumps(selftest(svc), ensure_ascii=False))
         if u.path == "/diagnose":
             return self._send(200, json.dumps(diagnose(), ensure_ascii=False))
         if u.path == "/engine/status":

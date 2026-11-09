@@ -126,6 +126,27 @@ def ensure_shim(log=print):
     return False
     return os.path.exists(PY) and os.path.exists(CFG)
 
+def _error_digest(text, limit=18):
+    """从引擎日志里提炼真正有用的报错行（ERROR/Traceback/Exception），再附尾部。"""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    key = []
+    for i, ln in enumerate(lines):
+        low = ln.lower()
+        if ("error" in low or "traceback" in low or "exception" in low
+                or "failed" in low or "cannot" in low or "timeout" in low
+                or "huggingface" in low or "connection" in low or "model" in low):
+            key.extend(lines[i:i + 3])
+        if len(key) > 40:
+            break
+    tail = lines[-limit:]
+    out = []
+    seen = set()
+    for ln in key + tail:
+        if ln not in seen:
+            seen.add(ln)
+            out.append(ln)
+    return chr(10).join(out[-40:])
+
 def available():
     return os.path.exists(PY)
 
@@ -157,6 +178,8 @@ def translate(src_pdf, out_dir, src="en", tgt="zh", base_name=None, log=print, p
     env["PYTHONUNBUFFERED"] = "1"
     env["COLUMNS"] = "200"
     env["LINES"] = "60"
+    # 版面模型默认从 HuggingFace 下载，国内直连常失败 → 默认走镜像，可覆盖
+    env.setdefault("HF_ENDPOINT", os.environ.get("PDFTRANS_HF_ENDPOINT", "https://hf-mirror.com"))
     with open(log_path, "wb") as fh:
         flags = 0
         if os.name == "nt":
@@ -187,13 +210,21 @@ def translate(src_pdf, out_dir, src="en", tgt="zh", base_name=None, log=print, p
     except Exception:
         text = ""
     if proc.returncode != 0:
-        tail = "\n".join([ln for ln in text.splitlines() if ln.strip()][-14:])
-        raise RuntimeError("pdf2zh_next 退出码 %d\n%s" % (proc.returncode, tail[-900:]))
-    mono = sorted(glob.glob(os.path.join(tmp, "*.mono.pdf")))
-    dual = sorted(glob.glob(os.path.join(tmp, "*.dual.pdf")))
+        raise RuntimeError("pdf2zh_next 退出码 %d" % proc.returncode + chr(10) + _error_digest(text))
+    mono = sorted(glob.glob(os.path.join(tmp, "**", "*.mono.pdf"), recursive=True))
+    dual = sorted(glob.glob(os.path.join(tmp, "**", "*.dual.pdf"), recursive=True))
+    if not mono:
+        # 有些版本写在当前工作目录
+        mono = sorted(glob.glob(os.path.join(_workdir(), "**", "*.mono.pdf"), recursive=True))
+        dual = sorted(glob.glob(os.path.join(_workdir(), "**", "*.dual.pdf"), recursive=True))
     if not mono:
         tail = chr(10).join([ln for ln in text.splitlines() if ln.strip()][-12:])
-        raise RuntimeError("pdf2zh_next 未产出文件。日志尾部：" + chr(10) + tail)
+        digest = _error_digest(text)
+        hint = ""
+        if "huggingface" in text.lower() or "model" in text.lower() or "connect" in text.lower():
+            hint = ("\n\n【很可能是版面模型下载失败】首次运行需要下载约 50MB 模型。\n"
+                    "请检查网络，或设置环境变量 PDFTRANS_HF_ENDPOINT 指向可用镜像后重试。")
+        raise RuntimeError("pdf2zh_next 未产出文件。" + hint + chr(10) + digest)
     os.makedirs(out_dir, exist_ok=True)
     base = base_name or os.path.splitext(os.path.basename(src_pdf))[0]
     out_mono = os.path.join(out_dir, "%s_%s.pdf" % (base, tgt))

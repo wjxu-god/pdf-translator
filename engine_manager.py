@@ -140,6 +140,35 @@ def install_babeldoc(log=print, progress=None):
     except Exception as e:
         log("腾讯引擎安装失败（不影响使用 BabelDOC）：%r" % (e,))
 
+    step(96, "预热版面模型（约 50MB，走国内镜像，仅首次需要）")
+    try:
+        warm = os.path.join(base, "warmup.pdf")
+        import pymupdf
+        d = pymupdf.open(); pg = d.new_page()
+        pg.insert_text((40, 80), "This is a warmup sentence.", fontsize=14, fontname="helv")
+        d.save(warm); d.close()
+        env2 = dict(os.environ)
+        env2["HF_ENDPOINT"] = env2.get("PDFTRANS_HF_ENDPOINT", "https://hf-mirror.com")
+        env2["PYTHONIOENCODING"] = "utf-8"
+        outdir = os.path.join(base, "warmup_out")
+        os.makedirs(outdir, exist_ok=True)
+        p = subprocess.Popen([vpy, "-c", "from pdf2zh_next.main import cli; cli()",
+                              warm, "--output", outdir, "--lang-in", "en", "--lang-out", "zh",
+                              "--bing"], cwd=base, env=env2,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             encoding="utf-8", errors="replace",
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        for line in p.stdout:
+            if line.strip():
+                log(line.rstrip()[:200])
+        p.wait()
+        if p.returncode == 0:
+            log("模型预热完成")
+        else:
+            log("模型预热未成功（不影响安装，首次翻译时会再尝试）")
+    except Exception as e:
+        log("模型预热跳过：%r" % (e,))
+
     step(100, "安装完成")
     return status()
 
