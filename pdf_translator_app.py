@@ -20,7 +20,7 @@ JOBS = {}
 HISTORY = os.path.join(HERE, "历史记录.json")
 SETTINGS = os.path.join(HERE, "设置.json")
 APP_NAME = "PDF翻译专家"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 def load_settings():
     try:
@@ -34,16 +34,30 @@ def save_settings(d):
     except Exception:
         pass
 
+def _writable(d):
+    try:
+        os.makedirs(d, exist_ok=True)
+        probe = os.path.join(d, ".w")
+        open(probe, "w").close()
+        os.remove(probe)
+        return True
+    except Exception:
+        return False
+
+def _fallback_dir():
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "PDF翻译专家", "译文输出")
+
 def outdir():
     p = (load_settings().get("outdir") or "").strip()
-    if not p:
-        p = os.path.join(HERE, "译文输出")
-    try:
-        os.makedirs(p, exist_ok=True)
-    except Exception:
-        p = os.path.join(HERE, "译文输出")
-        os.makedirs(p, exist_ok=True)
-    return p
+    if p and _writable(p):
+        return p
+    default = os.path.join(HERE, "译文输出")
+    if _writable(default):
+        return default
+    fb = _fallback_dir()
+    os.makedirs(fb, exist_ok=True)
+    return fb
 
 ENGINES = [
     ("auto",            "自动（推荐）",        "Bing → 腾讯 → Google → 本地"),
@@ -67,6 +81,27 @@ def babeldoc_ready():
         return babeldoc_engine.available()
     except Exception:
         return False
+
+def clear_outputs():
+    """一键清空：删除输出目录里的成果文件与上传缓存（保留目录本身）。"""
+    removed, freed = 0, 0
+    targets = [outdir(), UPLOADS]
+    for d in targets:
+        if not os.path.isdir(d):
+            continue
+        for n in os.listdir(d):
+            fp = os.path.join(d, n)
+            try:
+                if os.path.isfile(fp):
+                    freed += os.path.getsize(fp)
+                    os.remove(fp)
+                    removed += 1
+                elif os.path.isdir(fp) and os.path.basename(fp) in ("译文输出",):
+                    continue
+            except Exception:
+                pass
+    log("clear: %d files, %.1f MB" % (removed, freed / 1048576))
+    return {"removed": removed, "freed_mb": round(freed / 1048576, 1), "outdir": outdir()}
 
 def load_history():
     try:
@@ -197,6 +232,12 @@ a.primary{background:linear-gradient(90deg,#2f6dff,#3fa9ff);border:none;color:#0
 .badge.ok{color:#7ee0a8;border-color:#2b5a44;background:#10241b}
 .badge.no{color:#ff9b9b;border-color:#5b2a2a;background:#241212}
 .err{color:#ff9b9b;font-size:12px;margin-top:8px;white-space:pre-wrap;max-height:120px;overflow:auto}
+button.danger{background:#2a1620;border-color:#5b2a3a;color:#ffb3c1}
+button.danger:hover{background:#3d1e2b;border-color:#ff6b8b}
+#toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);opacity:0;
+ background:#1d2b47;border:1px solid #2f4a76;color:#dceaff;padding:10px 16px;border-radius:10px;
+ font-size:13px;transition:.25s;pointer-events:none}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 </style></head><body>
 <div class="wrap">
   <h1>PDF <span>翻译专家</span> <span class="ver">v__VERSION__</span></h1>
@@ -235,11 +276,26 @@ a.primary{background:linear-gradient(90deg,#2f6dff,#3fa9ff);border:none;color:#0
 
   <div class="foot">
     <div><span class="badge __BABEL_CLS__">BabelDOC 引擎：__BABEL_TXT__</span></div>
-    <div><button class="btn" onclick="openDir()">打开输出文件夹</button></div>
+    <div>
+      <button class="btn" onclick="openDir()">打开输出文件夹</button>
+      <button class="btn danger" onclick="clearAll()">一键清空</button>
+    </div>
   </div>
 </div>
 
+<div id="toast"></div>
 <script>
+function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');
+ clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),2200);}
+function clearAll(){
+ if(!confirm('清空输出目录里的所有译文和缓存？此操作不可撤销。')) return;
+ fetch('/clear',{method:'POST'}).then(r=>r.json()).then(j=>{
+   toast('已清理 '+j.removed+' 个文件，释放 '+j.freed_mb+' MB');
+   document.querySelectorAll('.file').forEach(el=>{
+     if(el.querySelector('.dl')) el.remove();
+   });
+ }).catch(()=>toast('清理失败'));
+}
 const drop=document.getElementById('drop'), filesBox=document.getElementById('files');
 const input=document.createElement('input'); input.type='file'; input.accept='.pdf'; input.multiple=true;
 drop.onclick=()=>input.click();
@@ -394,6 +450,8 @@ class H(BaseHTTPRequestHandler):
         return self._send(404, "not found", "text/plain")
 
     def do_POST(self):
+        if self.path == "/clear":
+            return self._send(200, json.dumps(clear_outputs(), ensure_ascii=False))
         if self.path == "/open":
             try:
                 os.startfile(outdir())

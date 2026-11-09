@@ -13,7 +13,13 @@ FONTS = [r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\Deng.ttf", r"C:\Window
 
 SKIP_CLASSES = {"formula", "image", "picture", "figure", "footnote-separator"}
 
+# PyMuPDF 内置 CJK 字体：不依赖系统字体，任何机器都能写中文
+BUILTIN_CJK = "china-s"
+
 def _font():
+    """返回可用字体文件；None 表示使用 PyMuPDF 内置 CJK 字体。"""
+    if os.environ.get("PDFTRANS_NO_SYSFONT"):
+        return None
     for f in FONTS:
         if os.path.exists(f):
             return f
@@ -330,7 +336,7 @@ def _fit_fontsize(text, rect, base, fontfile, min_fs=4.5, line_factor=1.18):
     import math
     import pymupdf
     try:
-        font = pymupdf.Font(fontfile=fontfile)
+        font = pymupdf.Font(fontfile=fontfile) if fontfile else pymupdf.Font("china-s")
     except Exception:
         return base
     def width_of(s, fs):
@@ -385,9 +391,11 @@ def _apply(page, work, translated):
         page.apply_redactions()
     for w, t, fs, rect0, is_cell in placements:
         try:
-            rc = page.insert_textbox(rect0, t, fontsize=fs, fontname="cjk", fontfile=font,
-                                     color=_rgb(w.get("color", 0)), align=3 if not is_cell else 0,
-                                     lineheight=1.15)
+            rc = page.insert_textbox(rect0, t, fontsize=fs,
+                                     fontname="cjk" if font else BUILTIN_CJK,
+                                     fontfile=font if font else None,
+                                     color=_rgb(w.get("color", 0)),
+                                     align=3 if not is_cell else 0, lineheight=1.15)
         except Exception:
             rc = -1
         if rc < 0:
@@ -396,8 +404,10 @@ def _apply(page, work, translated):
                 if fs2 < 3.5:
                     break
                 try:
-                    if page.insert_textbox(rect0, t, fontsize=fs2, fontname="cjk",
-                                           fontfile=font, color=_rgb(w.get("color", 0)),
+                    if page.insert_textbox(rect0, t, fontsize=fs2,
+                                           fontname="cjk" if font else BUILTIN_CJK,
+                                           fontfile=font if font else None,
+                                           color=_rgb(w.get("color", 0)),
                                            align=0, lineheight=1.1) >= 0:
                         break
                 except Exception:
@@ -407,9 +417,7 @@ def translate_pdf(src_path, out_path, src="en", tgt="zh", log=print, progress=No
     import pymupdf
     import pymupdf4llm
 
-    font = _font()
-    if not font:
-        raise RuntimeError("no CJK font found")
+    font = _font()   # 为空时回退到 PyMuPDF 内置 CJK 字体
 
     doc = pymupdf.open(src_path)
     try:
