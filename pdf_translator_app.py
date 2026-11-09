@@ -20,7 +20,7 @@ JOBS = {}
 HISTORY = os.path.join(HERE, "历史记录.json")
 SETTINGS = os.path.join(HERE, "设置.json")
 APP_NAME = "PDF翻译专家"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 
 def load_settings():
     try:
@@ -75,12 +75,53 @@ def log(msg):
     except Exception:
         pass
 
+INSTALL_STATE = {"running": False, "done": False, "error": None, "lines": [], "kind": ""}
+
+def _inst_log(msg):
+    INSTALL_STATE["lines"].append(str(msg)[-500:])
+    if len(INSTALL_STATE["lines"]) > 400:
+        INSTALL_STATE["lines"] = INSTALL_STATE["lines"][-400:]
+    log("install: " + str(msg)[:300])
+
+def start_install(kind):
+    import engine_manager as em
+    INSTALL_STATE.update({"running": True, "done": False, "error": None, "lines": [], "kind": kind})
+
+    def work():
+        try:
+            if kind == "babeldoc":
+                em.install_babeldoc(log=_inst_log,
+                                    progress=lambda pct, msg: INSTALL_STATE.update({"percent": pct}))
+            elif kind == "tencent":
+                em.install_tencent(log=_inst_log)
+            elif kind == "uninstall":
+                em.uninstall(log=_inst_log)
+            os.environ["PDF2ZH_HOME"] = em.base_dir() if em.has_babeldoc() else ""
+            INSTALL_STATE.update({"running": False, "done": True})
+        except Exception as e:
+            INSTALL_STATE.update({"running": False, "done": True, "error": str(e)[-400:]})
+            log("install error: %r" % (e,))
+
+    threading.Thread(target=work, daemon=True).start()
+    return True
+
 def babeldoc_ready():
     try:
         import babeldoc_engine
         return babeldoc_engine.available()
     except Exception:
         return False
+
+def engine_status():
+    try:
+        import engine_manager as em
+        st = em.status()
+    except Exception as e:
+        st = {"base": "", "babeldoc": False, "tencent": False, "error": repr(e)}
+    st.update({"running": INSTALL_STATE["running"], "done": INSTALL_STATE["done"],
+               "error": INSTALL_STATE["error"], "percent": INSTALL_STATE.get("percent", 0),
+               "lines": INSTALL_STATE["lines"][-120:]})
+    return st
 
 def clear_outputs():
     """一键清空：删除输出目录里的成果文件与上传缓存（保留目录本身）。"""
@@ -233,6 +274,7 @@ a.primary{background:linear-gradient(90deg,#2f6dff,#3fa9ff);border:none;color:#0
 .badge.no{color:#ff9b9b;border-color:#5b2a2a;background:#241212}
 .err{color:#ff9b9b;font-size:12px;margin-top:8px;white-space:pre-wrap;max-height:120px;overflow:auto}
 button.danger{background:#2a1620;border-color:#5b2a3a;color:#ffb3c1}
+#engLog{font-family:Consolas,monospace}
 button.danger:hover{background:#3d1e2b;border-color:#ff6b8b}
 #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);opacity:0;
  background:#1d2b47;border:1px solid #2f4a76;color:#dceaff;padding:10px 16px;border-radius:10px;
@@ -255,6 +297,22 @@ button.danger:hover{background:#3d1e2b;border-color:#ff6b8b}
         <select id="tgt"><option value="zh">中文</option><option value="en">英语</option><option value="ja">日语</option><option value="ko">韩语</option></select>
       </div>
     </div>
+  </div>
+
+  <div class="panel" id="enginePanel">
+    <div class="row" style="justify-content:space-between;align-items:center">
+      <div><div class="lbl" style="margin:0">翻译引擎组件</div>
+        <div class="sub" style="margin:6px 0 0">BabelDOC 排版引擎可选安装，装完排版更好；不装也能用本地引擎。</div>
+      </div>
+      <div class="row" style="gap:8px">
+        <button class="btn primary" id="btnBabel" onclick="installEngine('babeldoc')">一键安装 BabelDOC</button>
+        <button class="btn" id="btnTc" onclick="installEngine('tencent')">装腾讯免费引擎</button>
+        <button class="btn" onclick="installEngine('uninstall')">卸载组件</button>
+      </div>
+    </div>
+    <div id="engState" style="margin-top:10px;font-size:12px;color:var(--dim)"></div>
+    <pre id="engLog" style="display:none;margin-top:10px;max-height:170px;overflow:auto;background:#0e1626;
+         border:1px solid var(--line);border-radius:10px;padding:10px;font-size:11.5px;color:#9fb2d0;white-space:pre-wrap"></pre>
   </div>
 
   <div class="panel">
@@ -328,6 +386,41 @@ function setDir(p){
     }).catch(()=>{});
 }
 refreshSettings();
+refreshEngine();
+let engTimer=null;
+function refreshEngine(){
+  fetch('/engine/status').then(r=>r.json()).then(s=>{
+    const el=document.getElementById('engState');
+    const logEl=document.getElementById('engLog');
+    const b=s.babeldoc?'<span class="badge ok">已安装</span>':'<span class="badge no">未安装</span>';
+    const t=s.tencent?'<span class="badge ok">已安装</span>':'<span class="badge no">未安装</span>';
+    el.innerHTML='BabelDOC '+b+'　腾讯引擎 '+t+(s.base?('　<span style="color:#5b6b8c">'+s.base+'</span>'):'');
+    document.getElementById('btnBabel').style.display = s.babeldoc?'none':'';
+    if(s.running || (s.lines && s.lines.length)){
+      logEl.style.display='block';
+      logEl.textContent=(s.lines||[]).join('\n');
+      logEl.scrollTop=logEl.scrollHeight;
+    }
+    if(s.error){ logEl.style.display='block'; logEl.textContent += '\n[错误] '+s.error; }
+    if(s.running){
+      clearTimeout(engTimer); engTimer=setTimeout(refreshEngine,1500);
+    } else if(s.done){
+      clearTimeout(engTimer); engTimer=setTimeout(refreshEngine,4000);
+      if(s.babeldoc) toast('组件安装完成');
+    }
+  }).catch(()=>{});
+}
+function installEngine(kind){
+  let tip='';
+  if(kind==='babeldoc') tip='安装 BabelDOC 需要联网下载约 300~500MB，耗时 3~15 分钟，期间可以最小化窗口。继续？';
+  if(kind==='tencent') tip='安装腾讯免费翻译引擎（秒级完成）。继续？';
+  if(kind==='uninstall') tip='确定卸载已安装的引擎组件？将删除下载的组件，本地引擎仍可用。';
+  if(tip && !confirm(tip)) return;
+  fetch('/engine/install',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({kind:kind})}).then(r=>r.json()).then(()=>{
+      toast('已开始：'+kind); refreshEngine();
+    }).catch(()=>toast('启动失败'));
+}
 
 function queue(files){
   files.forEach(f=>{
@@ -426,6 +519,8 @@ class H(BaseHTTPRequestHandler):
             q = urllib.parse.parse_qs(u.query)
             jid = (q.get("id") or [""])[0]
             return self._send(200, json.dumps(JOBS.get(jid, {"stage": "unknown"}), ensure_ascii=False))
+        if u.path == "/engine/status":
+            return self._send(200, json.dumps(engine_status(), ensure_ascii=False))
         if u.path == "/settings":
             s = load_settings()
             return self._send(200, json.dumps({
@@ -450,6 +545,15 @@ class H(BaseHTTPRequestHandler):
         return self._send(404, "not found", "text/plain")
 
     def do_POST(self):
+        if self.path == "/engine/install":
+            n = int(self.headers.get("Content-Length") or 0)
+            kind = "babeldoc"
+            try:
+                kind = (json.loads(self.rfile.read(n).decode("utf-8")) or {}).get("kind") or "babeldoc"
+            except Exception:
+                pass
+            start_install(kind)
+            return self._send(200, json.dumps({"ok": True, "kind": kind}))
         if self.path == "/clear":
             return self._send(200, json.dumps(clear_outputs(), ensure_ascii=False))
         if self.path == "/open":
@@ -498,6 +602,12 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     os.makedirs(outdir(), exist_ok=True)
     os.makedirs(UPLOADS, exist_ok=True)
+    try:
+        import engine_manager as _em
+        if _em.has_babeldoc():
+            os.environ.setdefault("PDF2ZH_HOME", _em.base_dir())
+    except Exception:
+        pass
     log("tool started on %d" % PORT)
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
     if "--no-browser" not in sys.argv:

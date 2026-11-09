@@ -6,7 +6,9 @@ r"""给 pdf2zh_next 增加「腾讯免费翻译」引擎（TencentFree）
 import os, shutil, sys, time
 from pathlib import Path
 
-ENV = Path(r"D:\PDF_Translator\env")
+ENV = Path(os.environ.get("PDF2ZH_HOME") or r"D:\PDF_Translator") / "env"
+if not (ENV / "Lib" / "site-packages").exists():
+    ENV = Path(r"D:\PDF_Translator\env")
 SP = ENV / "Lib" / "site-packages" / "pdf2zh_next"
 MODEL_FILE = SP / "config" / "translate_engine_model.py"
 IMPL_DIR = SP / "translator" / "translator_impl"
