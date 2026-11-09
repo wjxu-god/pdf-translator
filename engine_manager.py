@@ -143,16 +143,114 @@ def install_babeldoc(log=print, progress=None):
     step(100, "安装完成")
     return status()
 
+IMPL_NAME = "tencentfree"
+IMPL_SRC = '''# -*- coding: utf-8 -*-
+"""腾讯交互翻译（免费匿名接口）—— pdf2zh_next 翻译引擎插件（由 PDF翻译专家 安装）"""
+import json
+import logging
+import time
+import urllib.request
+
+from pdf2zh_next.config.model import SettingsModel
+from pdf2zh_next.translator.base_rate_limiter import BaseRateLimiter
+from pdf2zh_next.translator.base_translator import BaseTranslator
+
+logger = logging.getLogger(__name__)
+
+API = "https://transmart.qq.com/api/imt"
+CLIENT_KEY = "desktop-dfc543ff7c364da490db1ddd1cd74dc9"
+
+
+class TencentFreeTranslator(BaseTranslator):
+    name = "tencentfree"
+    lang_map = {"zh": "zh", "zh-cn": "zh", "zh-tw": "zh", "auto": "en",
+                "en": "en", "ja": "ja", "ko": "ko", "de": "de", "fr": "fr",
+                "ru": "ru", "es": "es", "pt": "pt", "it": "it"}
+
+    def __init__(self, settings: SettingsModel, rate_limiter: BaseRateLimiter):
+        super().__init__(settings, rate_limiter)
+
+    def do_translate(self, text, rate_limit_params: dict = None) -> str:
+        body = {
+            "header": {"client_key": CLIENT_KEY, "fn": "auto_translation",
+                       "session": "", "user": ""},
+            "model_category": "normal",
+            "reference": {"sentence_lib": [], "term_lib": []},
+            "source": {"lang": self.lang_in, "text_list": [text]},
+            "target": {"lang": self.lang_out},
+            "type": "plain",
+        }
+        last = None
+        for attempt in range(4):
+            try:
+                req = urllib.request.Request(
+                    API, data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json",
+                             "User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=45) as r:
+                    j = json.loads(r.read().decode("utf-8", "replace"))
+                res = j.get("auto_translation") or []
+                if res and res[0]:
+                    return res[0]
+            except Exception as e:  # noqa: BLE001
+                last = e
+                time.sleep(1.0 + attempt * 1.5)
+        logger.warning("tencentfree translate failed: %r", last)
+        return text
+'''
+
+SETTINGS_CLASS = '''
+class TencentFreeSettings(BaseModel):
+    """Tencent free anonymous translation"""
+
+    translate_engine_type: Literal["TencentFree"] = Field(default="TencentFree")
+
+    def validate_settings(self) -> None:
+        pass
+
+
+'''
 def install_tencent(log=print):
-    py = env_python()
-    if not py:
-        raise RuntimeError("BabelDOC 尚未安装")
-    here = os.path.dirname(os.path.abspath(__file__))
-    patch = os.path.join(here, "install_tencent_free.py")
-    env = dict(os.environ)
-    env["PDF2ZH_HOME"] = base_dir()
-    subprocess.run([py, patch], check=True, env=env,
-                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    """在已安装的 venv 里写入腾讯翻译引擎并注册（不依赖外部脚本，exe 内可直接执行）。"""
+    base = base_dir()
+    site = None
+    for cand in (os.path.join(base, "env", "Lib", "site-packages"),
+                 *[os.path.join(base, "env", "lib", p, "site-packages")
+                   for p in (os.listdir(os.path.join(base, "env", "lib"))
+                             if os.path.isdir(os.path.join(base, "env", "lib")) else [])]):
+        if os.path.isdir(cand):
+            site = cand
+            break
+    if not site:
+        raise RuntimeError("未找到 site-packages，请先安装 BabelDOC")
+    pkg = os.path.join(site, "pdf2zh_next")
+    if not os.path.isdir(pkg):
+        raise RuntimeError("未找到 pdf2zh_next，请先安装 BabelDOC")
+
+    impl_dir = os.path.join(pkg, "translator", "translator_impl")
+    os.makedirs(impl_dir, exist_ok=True)
+    impl_path = os.path.join(impl_dir, IMPL_NAME + ".py")
+    open(impl_path, "w", encoding="utf-8").write(IMPL_SRC)
+    log("写入翻译器: %s" % impl_path)
+
+    model_file = os.path.join(pkg, "config", "translate_engine_model.py")
+    src = open(model_file, encoding="utf-8").read()
+    if "TencentFreeSettings" not in src:
+        anchor = "TRANSLATION_ENGINE_SETTING_TYPE: TypeAlias = ("
+        if anchor not in src:
+            raise RuntimeError("引擎注册锚点未找到，pdf2zh_next 版本可能不兼容")
+        src = src.replace(anchor, SETTINGS_CLASS + anchor, 1)
+        if "| CLISettings\n)" in src:
+            src = src.replace("| CLISettings\n)", "| CLISettings\n    | TencentFreeSettings\n)", 1)
+        else:
+            raise RuntimeError("引擎联合类型锚点未找到")
+        bak = model_file + ".bak-" + time.strftime("%Y%m%d-%H%M%S")
+        shutil.copyfile(model_file, bak)
+        open(model_file, "w", encoding="utf-8").write(src)
+        log("注册引擎: TencentFree（备份 %s）" % os.path.basename(bak))
+    else:
+        log("注册已存在，跳过")
+    return True
 
 def uninstall(log=print):
     base = base_dir()

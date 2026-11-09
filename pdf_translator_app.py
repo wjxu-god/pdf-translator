@@ -3,6 +3,8 @@
 引擎：BabelDOC（Bing / 腾讯免费 / Google / 免费大模型）+ 本地自研引擎
 """
 import base64, json, os, subprocess, sys, threading, time, traceback, urllib.parse, uuid, webbrowser
+
+# 本地模块按需延迟导入（打包时用 --hidden-import 显式收集），避免拖慢启动
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 if getattr(sys, "frozen", False):
@@ -20,7 +22,7 @@ JOBS = {}
 HISTORY = os.path.join(HERE, "历史记录.json")
 SETTINGS = os.path.join(HERE, "设置.json")
 APP_NAME = "PDF翻译专家"
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.3"
 
 def load_settings():
     try:
@@ -124,7 +126,7 @@ def babeldoc_ready(force=False):
         pass
     if not ok:
         try:
-            import babeldoc_engine
+            import pdf_engine_babeldoc as babeldoc_engine
             ok = babeldoc_engine.available()
         except Exception:
             ok = False
@@ -150,7 +152,7 @@ def diagnose():
         st = {}
 
     try:
-        import babeldoc_engine as be
+        import pdf_engine_babeldoc as be
         add("适配器可用", be.available(), "ROOT=%s\nPY=%s\nCFG=%s\nworkdir=%s"
             % (be.ROOT, be.PY, be.CFG or "(无)", be._workdir()))
         if be.available():
@@ -243,7 +245,7 @@ def run_job(job_id, name, raw, src, tgt, engine):
         job.update({"stage": "准备引擎", "percent": 2})
 
         def call_babeldoc(service):
-            import babeldoc_engine
+            import pdf_engine_babeldoc as babeldoc_engine
             return babeldoc_engine.translate(
                 tmp, out_dir, src, tgt, base, log=log,
                 progress=lambda ev: job.update(ev), service=service)
@@ -263,6 +265,12 @@ def run_job(job_id, name, raw, src, tgt, engine):
         chain = []
         if engine == "auto":
             chain = ["bing", "tencentfree", "google"]
+            try:
+                import engine_manager as _em3
+                if not _em3.has_tencent():
+                    chain = [c for c in chain if c != "tencentfree"]
+            except Exception:
+                chain = [c for c in chain if c != "tencentfree"]
         elif explicit:
             chain = [{"babeldoc_bing": "bing", "babeldoc_tencent": "tencentfree",
                       "babeldoc_google": "google", "babeldoc_llm": "siliconflowfree"}.get(engine, "bing")]
@@ -276,6 +284,18 @@ def run_job(job_id, name, raw, src, tgt, engine):
                     return
                 job.update({"stage": "回退本地引擎", "percent": 4, "note": "BabelDOC 未就绪"})
             else:
+                try:
+                    import engine_manager as _em2
+                    tencent_ok = _em2.has_tencent()
+                except Exception:
+                    tencent_ok = False
+                if engine == "babeldoc_tencent" and not tencent_ok:
+                    job.update({"stage": "error", "percent": 0,
+                                "error": "腾讯免费引擎尚未安装。\n"
+                                         "请点开「高级：翻译引擎组件」→「装腾讯引擎」（几秒钟），"
+                                         "或把引擎改成「BabelDOC + Bing」。\n"
+                                         "提示：不装腾讯引擎不影响 BabelDOC 的 Bing / Google 通道。"})
+                    return
                 last_err = None
                 for svc in chain:
                     try:
@@ -424,8 +444,13 @@ button.danger:hover{background:#3d1e2b;border-color:#ff6b8b}
           </div>
         </div>
         <div id="engState" style="margin-top:8px"></div>
-        <pre id="engLog" style="display:none;margin-top:10px;max-height:170px;overflow:auto;background:#0e1626;
-             border:1px solid var(--line);border-radius:10px;padding:10px;font-size:11.5px;color:#9fb2d0;white-space:pre-wrap"></pre>
+        <div id="logTools" style="display:none;margin-top:10px;gap:8px">
+        <button class="btn" onclick="copyLog()">复制日志</button>
+        <button class="btn" onclick="saveLog()">导出日志文件</button>
+      </div>
+      <pre id="engLog" style="display:none;margin-top:8px;max-height:170px;overflow:auto;background:#0e1626;
+             border:1px solid var(--line);border-radius:10px;padding:10px;font-size:11.5px;color:#9fb2d0;
+             white-space:pre-wrap;user-select:text;cursor:text"></pre>
       </div>
     </details>
   </div>
@@ -503,8 +528,9 @@ function refreshEngine(){
     const t=s.tencent?'<span class="badge ok">已安装</span>':'<span class="badge no">未安装</span>';
     el.innerHTML='BabelDOC '+b+'　腾讯引擎 '+t+(s.base?('　<span style="color:#5b6b8c">'+s.base+'</span>'):'');
     document.getElementById('btnBabel').style.display = s.babeldoc?'none':'';
+    const tools=document.getElementById('logTools');
     if(s.running || (s.lines && s.lines.length)){
-      logEl.style.display='block';
+      logEl.style.display='block'; if(tools) tools.style.display='flex';
       logEl.textContent=(s.lines||[]).join('\n');
       logEl.scrollTop=logEl.scrollHeight;
     }
@@ -519,6 +545,26 @@ function refreshEngine(){
       }
     }
   }).catch(()=>{});
+}
+function copyLog(){
+  const t=document.getElementById('engLog').textContent||'';
+  if(!t){ toast('暂无日志'); return; }
+  const done=()=>toast('已复制到剪贴板（'+t.length+' 字）');
+  if(navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(t).then(done).catch(fallback); }
+  else fallback();
+  function fallback(){
+    const ta=document.createElement('textarea'); ta.value=t; document.body.appendChild(ta);
+    ta.select(); try{ document.execCommand('copy'); done(); }catch(e){ toast('复制失败，请手动选择文本'); }
+    document.body.removeChild(ta);
+  }
+}
+function saveLog(){
+  const t=document.getElementById('engLog').textContent||'';
+  if(!t){ toast('暂无日志'); return; }
+  fetch('/save-log',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({text:t})}).then(r=>r.json()).then(j=>{
+      toast(j.path?('已保存：'+j.path):'保存失败');
+    }).catch(()=>toast('保存失败'));
 }
 function diagnose(){
   const logEl=document.getElementById('engLog');
@@ -684,6 +730,17 @@ class H(BaseHTTPRequestHandler):
         return self._send(404, "not found", "text/plain")
 
     def do_POST(self):
+        if self.path == "/save-log":
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                d = json.loads(self.rfile.read(n).decode("utf-8"))
+                text = d.get("text") or ""
+                name = "诊断日志_%s.txt" % time.strftime("%Y%m%d_%H%M%S")
+                path = os.path.join(outdir(), name)
+                open(path, "w", encoding="utf-8-sig").write(text)
+                return self._send(200, json.dumps({"path": path}, ensure_ascii=False))
+            except Exception as e:
+                return self._send(200, json.dumps({"error": str(e)}, ensure_ascii=False))
         if self.path == "/engine/install":
             n = int(self.headers.get("Content-Length") or 0)
             kind = "babeldoc"
