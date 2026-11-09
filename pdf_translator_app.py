@@ -22,7 +22,7 @@ JOBS = {}
 HISTORY = os.path.join(HERE, "历史记录.json")
 SETTINGS = os.path.join(HERE, "设置.json")
 APP_NAME = "PDF翻译专家"
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.2"
 
 def load_settings():
     try:
@@ -49,6 +49,19 @@ def _writable(d):
 def _fallback_dir():
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     return os.path.join(base, "PDF翻译专家", "译文输出")
+
+def safe_name(name):
+    """文件名/文件夹名净化：去掉 Windows 非法字符。"""
+    name = os.path.basename(name or "document")
+    for ch in '<>:"/\\|?*':
+        name = name.replace(ch, "_")
+    name = name.strip(" .") or "document"
+    return name[:80]
+
+def doc_folder(base_name):
+    d = os.path.join(outdir(), safe_name(base_name))
+    os.makedirs(d, exist_ok=True)
+    return d
 
 def outdir():
     p = (load_settings().get("outdir") or "").strip()
@@ -268,7 +281,9 @@ def run_job(job_id, name, raw, src, tgt, engine):
         out_dir = outdir()
         os.makedirs(UPLOADS, exist_ok=True)
         base = os.path.splitext(name)[0] or "document"
-        tmp = os.path.join(out_dir, "_src_" + job_id + ".pdf")
+        tgt_dir = doc_folder(base)
+        job.update({"folder": os.path.basename(tgt_dir)})
+        tmp = os.path.join(tgt_dir, "_src.pdf")
         open(tmp, "wb").write(raw)
         protected = os.path.join(UPLOADS, name)
         try:
@@ -280,15 +295,21 @@ def run_job(job_id, name, raw, src, tgt, engine):
         def call_babeldoc(service):
             import pdf_engine_babeldoc as babeldoc_engine
             return babeldoc_engine.translate(
-                tmp, out_dir, src, tgt, base, log=log,
+                tmp, tgt_dir, src, tgt, base, log=log,
                 progress=lambda ev: job.update(ev), service=service)
 
         def finish(res):
-            mono = os.path.basename(res["mono"])
-            dual = os.path.basename(res["dual"]) if res.get("dual") else None
+            mono = os.path.join(os.path.basename(tgt_dir), os.path.basename(res["mono"]))
+            dual = (os.path.join(os.path.basename(tgt_dir), os.path.basename(res["dual"]))
+                    if res.get("dual") else None)
             job.update({"stage": "done", "percent": 100, "out": mono, "dual": dual,
+                        "folder": os.path.basename(tgt_dir),
                         "engine_used": res.get("engine_used", job.get("engine_label", "")),
                         "elapsed": int(time.time() - job.get("t0", time.time()))})
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
             add_history({"name": name, "out": mono, "dual": dual,
                          "engine": job.get("engine_label", ""),
                          "time": time.strftime("%Y-%m-%d %H:%M")})
@@ -352,7 +373,7 @@ def run_job(job_id, name, raw, src, tgt, engine):
         job.update({"stage": "本地引擎处理", "percent": 5, "service": "local"})
         import pdf_translate
         out_name = "%s_%s.pdf" % (base, tgt)
-        out_path = os.path.join(out_dir, out_name)
+        out_path = os.path.join(tgt_dir, out_name)
         st = pdf_translate.translate_pdf(
             tmp, out_path, src, tgt, log=log,
             progress=lambda a, b: job.update({"page": a, "pages": b,
@@ -360,9 +381,15 @@ def run_job(job_id, name, raw, src, tgt, engine):
                                               "stage": "翻译与回填"}))
         dual = st.get("dual")
         job.update({"stage": "done", "percent": 100, "engine_used": "本地引擎",
-                    "out": os.path.basename(out_path),
-                    "dual": os.path.basename(dual) if dual else None,
+                    "out": os.path.join(os.path.basename(tgt_dir), os.path.basename(out_path)),
+                    "dual": (os.path.join(os.path.basename(tgt_dir), os.path.basename(dual))
+                             if dual else None),
+                    "folder": os.path.basename(tgt_dir),
                     "elapsed": int(time.time() - job.get("t0", time.time()))})
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
         add_history({"name": name, "out": os.path.basename(out_path),
                      "dual": os.path.basename(dual) if dual else None,
                      "engine": "本地引擎", "time": time.strftime("%Y-%m-%d %H:%M")})
@@ -527,7 +554,13 @@ function refreshSettings(){
     const el=document.getElementById('outdir'); if(el) el.value=s.outdir||'';
   }).catch(()=>{});
 }
-function openDir(){ fetch('/open',{method:'POST'}).catch(()=>{}); }
+function openDir(){ fetch('/open',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).catch(()=>{}); }
+function openFolder(name){
+  fetch('/open',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name:name})}).then(r=>r.json()).then(j=>{
+      if(j.path) toast('已打开：'+j.path);
+    }).catch(()=>toast('打开失败'));
+}
 function pickDir(){
   if(window.pywebview && window.pywebview.api && window.pywebview.api.choose_folder){
     window.pywebview.api.choose_folder().then(d=>{ if(d) setDir(d); });
@@ -704,6 +737,7 @@ function poll(id, job){
       let html='<div class="dl">';
       if(j.out)  html+='<a class="btn primary" href="/file?name='+encodeURIComponent(j.out)+'">下载纯译文</a>';
       if(j.dual) html+='<a class="btn" href="/file?name='+encodeURIComponent(j.dual)+'">下载对照版</a>';
+      if(j.folder) html+='<button class="btn" onclick="openFolder(\''+j.folder.replace(/'/g,"")+'\')">打开文件夹</button>';
       html+='</div>';
       job.card.insertAdjacentHTML('beforeend', html);
       running=false; pump(); return;
@@ -768,8 +802,11 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(load_history(), ensure_ascii=False))
         if u.path == "/file":
             q = urllib.parse.parse_qs(u.query)
-            name = os.path.basename((q.get("name") or [""])[0])
-            path = os.path.join(outdir(), name)
+            rel = (q.get("name") or [""])[0].replace("\\", "/")
+            path = os.path.normpath(os.path.join(outdir(), rel))
+            if not path.startswith(os.path.normpath(outdir())):
+                return self._send(403, "forbidden", "text/plain")
+            name = os.path.basename(path)
             if os.path.exists(path):
                 data = open(path, "rb").read()
                 self.send_response(200)
@@ -806,11 +843,20 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/clear":
             return self._send(200, json.dumps(clear_outputs(), ensure_ascii=False))
         if self.path == "/open":
+            n = int(self.headers.get("Content-Length") or 0)
+            rel = ""
             try:
-                os.startfile(outdir())
+                rel = (json.loads(self.rfile.read(n).decode("utf-8")) or {}).get("name") or ""
+            except Exception:
+                rel = ""
+            target = os.path.normpath(os.path.join(outdir(), rel)) if rel else outdir()
+            if not target.startswith(os.path.normpath(outdir())) or not os.path.isdir(target):
+                target = outdir()
+            try:
+                os.startfile(target)
             except Exception:
                 pass
-            return self._send(200, json.dumps({"ok": True}))
+            return self._send(200, json.dumps({"ok": True, "path": target}, ensure_ascii=False))
         if self.path == "/settings":
             n = int(self.headers.get("Content-Length") or 0)
             try:

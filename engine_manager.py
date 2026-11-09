@@ -134,6 +134,12 @@ def install_babeldoc(log=print, progress=None):
     if not os.path.exists(cfg):
         open(cfg, "w", encoding="utf-8").write('config_file = "null"\nreport_interval = 0.2\n')
 
+    step(90, "修复 babeldoc 的 PDF 解析问题（内联图像 EI）")
+    try:
+        install_ei_patch(log=log)
+    except Exception as e:
+        log("EI 补丁未应用（不影响大多数 PDF）：%r" % (e,))
+
     step(92, "安装腾讯免费翻译引擎")
     try:
         install_tencent(log=log)
@@ -239,6 +245,82 @@ class TencentFreeSettings(BaseModel):
 
 
 '''
+def _site_packages(base):
+    for cand in (os.path.join(base, "env", "Lib", "site-packages"),
+                 *[os.path.join(base, "env", "lib", p, "site-packages")
+                   for p in (os.listdir(os.path.join(base, "env", "lib"))
+                             if os.path.isdir(os.path.join(base, "env", "lib")) else [])]):
+        if os.path.isdir(cand):
+            return cand
+    return None
+
+
+EI_NEW_METHOD = '''    def _is_inline_image_ei_at(self, pos: int) -> bool:
+        if self._is_delimited_keyword_at(pos, b"EI"):
+            return True
+        if pos > 0 and self.data[pos - 1 : pos] == b">":
+            next_pos = pos + 2
+            return (next_pos >= len(self.data)
+                    or self.data[next_pos : next_pos + 1] in WHITESPACE)
+        return False
+
+'''
+
+EI_OLD_CONSUME = '''    def _consume_inline_image_end(self) -> bool:
+        probe = self.pos
+        while probe < len(self.data) and self.data[probe : probe + 1] in WHITESPACE:
+            probe += 1
+'''
+
+EI_NEW_CONSUME = '''    def _consume_inline_image_end(self) -> bool:
+        probe = self.pos
+        if probe < len(self.data) and self.data[probe : probe + 1] == b">":
+            probe += 1
+        while probe < len(self.data) and self.data[probe : probe + 1] in WHITESPACE:
+            probe += 1
+'''
+
+
+def install_ei_patch(log=print):
+    """给 babeldoc 的 PDF tokenizer 打内联图像 EI 宽容补丁。"""
+    base = base_dir()
+    site = _site_packages(base)
+    if not site:
+        raise RuntimeError("未找到 site-packages")
+    target = os.path.join(site, "babeldoc", "format", "pdf", "new_parser", "tokenizer.py")
+    if not os.path.isfile(target):
+        raise RuntimeError("未找到 babeldoc tokenizer")
+    src = open(target, encoding="utf-8").read()
+    if "_is_inline_image_ei_at" in src:
+        log("EI 补丁已存在，跳过")
+        return True
+    anchors = [
+        ('            if not self._is_delimited_keyword_at(pos, b"EI"):\n',
+         "            if not self._is_inline_image_ei_at(pos):\n"),
+        ('        if not self._is_delimited_keyword_at(probe, b"EI"):\n',
+         "        if self._is_inline_image_ei_at(probe):\n"),
+        (EI_OLD_CONSUME, EI_NEW_CONSUME),
+        ("    def _is_delimited_keyword_at(self, pos: int, keyword: bytes) -> bool:\n",
+         EI_NEW_METHOD + "    def _is_delimited_keyword_at(self, pos: int, keyword: bytes) -> bool:\n"),
+    ]
+    out = src
+    for old, new in anchors:
+        if out.count(old) != 1:
+            raise RuntimeError("锚点未命中（babeldoc 版本可能不同）")
+        out = out.replace(old, new, 1)
+    bak = target + ".bak-" + time.strftime("%Y%m%d-%H%M%S")
+    shutil.copyfile(target, bak)
+    open(target, "w", encoding="utf-8").write(out)
+    try:
+        import py_compile
+        py_compile.compile(target, doraise=True)
+    except Exception as e:
+        shutil.copyfile(bak, target)
+        raise RuntimeError("补丁后语法校验失败，已回滚：%r" % (e,))
+    log("EI 补丁已应用（备份 %s）" % os.path.basename(bak))
+    return True
+
+
 def install_tencent(log=print):
     """在已安装的 venv 里写入腾讯翻译引擎并注册（不依赖外部脚本，exe 内可直接执行）。"""
     base = base_dir()

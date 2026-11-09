@@ -126,9 +126,50 @@ def ensure_shim(log=print):
     return False
     return os.path.exists(PY) and os.path.exists(CFG)
 
+def _unwrap(text):
+    """rich 会把长行按 80 列折行并加缩进，这里把续行拼回上一行，还原完整报错。"""
+    out = []
+    for ln in text.splitlines():
+        if not ln.strip():
+            out.append("")
+            continue
+        if ln.startswith(" " * 8) and out and out[-1]:
+            out[-1] = out[-1].rstrip() + ln.strip()
+        else:
+            out.append(ln.rstrip())
+    return out
+
+
+def _normalize_pdf(src_path, dst_path, log=print):
+    """用 PyMuPDF 重写 PDF：修复内联图像等结构问题（BabelDOC 的 Rust 解析器对这类文件会直接失败）。"""
+    try:
+        import pymupdf
+        d = pymupdf.open(src_path)
+        d.save(dst_path, garbage=4, deflate=True, clean=True)
+        d.close()
+        log("  已规范化 PDF：%s" % os.path.basename(dst_path))
+        return dst_path
+    except Exception as e:
+        log("  规范化失败，使用原文件：%r" % (e,))
+        return src_path
+
+
+def _dump_log(text, out_dir):
+    """把引擎完整日志写到输出目录，方便用户直接发给我们。"""
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        p = os.path.join(out_dir, "引擎日志_" + time.strftime("%Y%m%d_%H%M%S") + ".txt")
+        with open(p, "w", encoding="utf-8-sig") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + chr(10))
+            f.write(text)
+        return p
+    except Exception as e:
+        return "(保存失败: %r)" % (e,)
+
+
 def _error_digest(text, limit=18):
     """从引擎日志里提炼真正有用的报错行（ERROR/Traceback/Exception），再附尾部。"""
-    lines = [ln for ln in text.splitlines() if ln.strip()]
+    lines = [ln for ln in _unwrap(text) if ln.strip()]
     key = []
     for i, ln in enumerate(lines):
         low = ln.lower()
@@ -166,6 +207,12 @@ def translate(src_pdf, out_dir, src="en", tgt="zh", base_name=None, log=print, p
         ensure_shim(log)
     tmp = tempfile.mkdtemp(prefix="babeldoc_")
     log_path = os.path.join(tmp, "engine.log")
+
+    # 关键：先用 PyMuPDF 重写一遍，规避 BabelDOC Rust 解析器对内联图像的严格校验
+    # （必须在拼命令行之前完成，否则命令里还是原始文件）
+    norm = os.path.join(tmp, "normalized.pdf")
+    src_pdf = _normalize_pdf(src_pdf, norm, log)
+
     cmd = [PY, "-u", "-c", "from pdf2zh_next.main import cli; cli()",
            src_pdf, "--output", tmp,
            "--lang-in", src, "--lang-out", tgt,
@@ -209,8 +256,10 @@ def translate(src_pdf, out_dir, src="en", tgt="zh", base_name=None, log=print, p
         text = open(log_path, "rb").read().decode("utf-8", "replace")
     except Exception:
         text = ""
+    dump = _dump_log(text, out_dir) if (proc.returncode != 0) else ""
     if proc.returncode != 0:
-        raise RuntimeError("pdf2zh_next 退出码 %d" % proc.returncode + chr(10) + _error_digest(text))
+        raise RuntimeError("pdf2zh_next 退出码 %d" % proc.returncode + chr(10)
+                           + _error_digest(text) + chr(10) + "完整日志：" + dump)
     mono = sorted(glob.glob(os.path.join(tmp, "**", "*.mono.pdf"), recursive=True))
     dual = sorted(glob.glob(os.path.join(tmp, "**", "*.dual.pdf"), recursive=True))
     if not mono:
@@ -224,7 +273,9 @@ def translate(src_pdf, out_dir, src="en", tgt="zh", base_name=None, log=print, p
         if "huggingface" in text.lower() or "model" in text.lower() or "connect" in text.lower():
             hint = ("\n\n【很可能是版面模型下载失败】首次运行需要下载约 50MB 模型。\n"
                     "请检查网络，或设置环境变量 PDFTRANS_HF_ENDPOINT 指向可用镜像后重试。")
-        raise RuntimeError("pdf2zh_next 未产出文件。" + hint + chr(10) + digest)
+        dump = _dump_log(text, out_dir)
+        raise RuntimeError("pdf2zh_next 未产出文件。" + hint + chr(10) + digest
+                           + chr(10) + "完整日志：" + dump)
     os.makedirs(out_dir, exist_ok=True)
     base = base_name or os.path.splitext(os.path.basename(src_pdf))[0]
     out_mono = os.path.join(out_dir, "%s_%s.pdf" % (base, tgt))
