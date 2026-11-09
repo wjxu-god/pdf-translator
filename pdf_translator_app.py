@@ -20,7 +20,7 @@ JOBS = {}
 HISTORY = os.path.join(HERE, "历史记录.json")
 SETTINGS = os.path.join(HERE, "设置.json")
 APP_NAME = "PDF翻译专家"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 def load_settings():
     try:
@@ -131,6 +131,54 @@ def babeldoc_ready(force=False):
     _BABEL_CACHE.update({"t": now, "v": ok})
     return ok
 
+def diagnose():
+    """产品诊断：把引擎链路每一环的真实状态都跑一遍，供用户/开发者定位问题。"""
+    import subprocess
+    out = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "checks": []}
+
+    def add(name, ok, detail=""):
+        out["checks"].append({"name": name, "ok": bool(ok), "detail": str(detail)[:600]})
+
+    try:
+        import engine_manager as em
+        st = em.status()
+        add("引擎管理器", True, "base=%s" % st.get("base"))
+        add("BabelDOC 已安装", st.get("babeldoc"), "python=%s" % (st.get("python") or "未找到"))
+        add("腾讯免费引擎", st.get("tencent"))
+    except Exception as e:
+        add("引擎管理器", False, repr(e))
+        st = {}
+
+    try:
+        import babeldoc_engine as be
+        add("适配器可用", be.available(), "ROOT=%s\nPY=%s\nCFG=%s\nworkdir=%s"
+            % (be.ROOT, be.PY, be.CFG or "(无)", be._workdir()))
+        if be.available():
+            r = subprocess.run([be.PY, "-c", "import pdf2zh_next,babeldoc;print('import-ok')"],
+                               capture_output=True, text=True, timeout=120,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            add("pdf2zh_next 可导入", "import-ok" in (r.stdout or ""),
+                (r.stdout or "") + (r.stderr or "")[-300:])
+    except Exception as e:
+        add("适配器可用", False, repr(e))
+
+    try:
+        ok = babeldoc_ready(force=True)
+        add("就绪判断（界面用的）", ok, "PDF2ZH_HOME=%s" % (os.environ.get("PDF2ZH_HOME") or "(未设置)"))
+    except Exception as e:
+        add("就绪判断（界面用的）", False, repr(e))
+
+    try:
+        import socket
+        with socket.socket() as s:
+            s.settimeout(2)
+            reach = s.connect_ex(("transmart.qq.com", 443)) == 0
+        add("腾讯翻译接口连通", reach, "transmart.qq.com:443")
+    except Exception as e:
+        add("腾讯翻译接口连通", False, repr(e))
+
+    return out
+
 def engine_status():
     try:
         import engine_manager as em
@@ -204,29 +252,49 @@ def run_job(job_id, name, raw, src, tgt, engine):
             mono = os.path.basename(res["mono"])
             dual = os.path.basename(res["dual"]) if res.get("dual") else None
             job.update({"stage": "done", "percent": 100, "out": mono, "dual": dual,
+                        "engine_used": res.get("engine_used", job.get("engine_label", "")),
                         "elapsed": int(time.time() - job.get("t0", time.time()))})
             add_history({"name": name, "out": mono, "dual": dual,
                          "engine": job.get("engine_label", ""),
                          "time": time.strftime("%Y-%m-%d %H:%M")})
             log("done %s -> %s" % (name, mono))
 
+        explicit = engine.startswith("babeldoc")
         chain = []
         if engine == "auto":
             chain = ["bing", "tencentfree", "google"]
-        elif engine.startswith("babeldoc"):
+        elif explicit:
             chain = [{"babeldoc_bing": "bing", "babeldoc_tencent": "tencentfree",
                       "babeldoc_google": "google", "babeldoc_llm": "siliconflowfree"}.get(engine, "bing")]
-        if chain and babeldoc_ready(force=True):
-            for svc in chain:
-                try:
-                    job.update({"stage": "引擎启动", "service": svc, "percent": 3})
-                    res = call_babeldoc(svc)
-                    finish(res)
+        if chain:
+            if not babeldoc_ready(force=True):
+                if explicit:
+                    job.update({"stage": "error", "percent": 0,
+                                "error": "你选择的是 BabelDOC 引擎，但本机未检测到可用安装。\n"
+                                         "请点开底部「高级：翻译引擎组件」→「安装 BabelDOC」，"
+                                         "或改选「本地引擎」/「自动」。"})
                     return
-                except Exception as e:
-                    log("  !! %s failed: %r" % (svc, e))
-                    job.update({"stage": "切换备用通道", "percent": 4,
-                                "note": "BabelDOC 引擎调用失败：%s" % (str(e)[:120],)})
+                job.update({"stage": "回退本地引擎", "percent": 4, "note": "BabelDOC 未就绪"})
+            else:
+                last_err = None
+                for svc in chain:
+                    try:
+                        job.update({"stage": "引擎启动", "service": svc, "percent": 3})
+                        res = call_babeldoc(svc)
+                        res["engine_used"] = "BabelDOC+" + svc
+                        finish(res)
+                        return
+                    except Exception as e:
+                        last_err = e
+                        log("  !! %s failed: %r" % (svc, e))
+                        job.update({"stage": "通道失败，尝试下一个", "percent": 4,
+                                    "note": "BabelDOC(%s) 失败：%s" % (svc, str(e)[:150])})
+                if explicit:
+                    job.update({"stage": "error", "percent": 0,
+                                "error": "BabelDOC 引擎调用失败：%s\n\n"
+                                         "可在「高级：翻译引擎组件」里点「诊断」查看详细原因，"
+                                         "或改选「自动」让它自动换通道。" % (str(last_err)[:400],)})
+                    return
         # local engine fallback
         job.update({"stage": "本地引擎处理", "percent": 5, "service": "local"})
         import pdf_translate
@@ -238,7 +306,7 @@ def run_job(job_id, name, raw, src, tgt, engine):
                                               "percent": int(100.0 * a / max(b, 1)),
                                               "stage": "翻译与回填"}))
         dual = st.get("dual")
-        job.update({"stage": "done", "percent": 100,
+        job.update({"stage": "done", "percent": 100, "engine_used": "本地引擎",
                     "out": os.path.basename(out_path),
                     "dual": os.path.basename(dual) if dual else None,
                     "elapsed": int(time.time() - job.get("t0", time.time()))})
@@ -351,6 +419,7 @@ button.danger:hover{background:#3d1e2b;border-color:#ff6b8b}
             <button class="btn" id="btnBabel" onclick="installEngine('babeldoc')">安装 BabelDOC</button>
             <button class="btn" id="btnTc" onclick="installEngine('tencent')">装腾讯引擎</button>
             <button class="btn" onclick="changeEngineDir()">更改位置</button>
+            <button class="btn" onclick="diagnose()">诊断</button>
             <button class="btn danger" onclick="installEngine('uninstall')">卸载</button>
           </div>
         </div>
@@ -451,6 +520,19 @@ function refreshEngine(){
     }
   }).catch(()=>{});
 }
+function diagnose(){
+  const logEl=document.getElementById('engLog');
+  logEl.style.display='block';
+  logEl.textContent='正在诊断…';
+  fetch('/diagnose').then(r=>r.json()).then(d=>{
+    const lines=[];
+    (d.checks||[]).forEach(c=>{
+      lines.push((c.ok?'[OK]  ':'[失败] ')+c.name);
+      if(c.detail) lines.push('        '+String(c.detail).replace(/\n/g,'\n        '));
+    });
+    logEl.textContent=lines.join('\n');
+  }).catch(e=>{ logEl.textContent='诊断失败: '+e; });
+}
 function changeEngineDir(){
   const cur = document.getElementById('engPath').textContent || '';
   const pick = (window.pywebview && window.pywebview.api && window.pywebview.api.choose_folder)
@@ -522,7 +604,7 @@ function poll(id, job){
     if(!p && j.pages && j.page) p=Math.min(99,Math.round(100*j.page/j.pages));
     fill.style.width=p+'%'; ph.textContent=p+'%';
     if(j.stage==='done'){
-      st.textContent='完成 · '+Math.round(j.elapsed||0)+' 秒';
+      st.textContent='完成 · '+Math.round(j.elapsed||0)+' 秒'+(j.engine_used?(' · '+j.engine_used):'');
       sv.textContent='';
       let html='<div class="dl">';
       if(j.out)  html+='<a class="btn primary" href="/file?name='+encodeURIComponent(j.out)+'">下载纯译文</a>';
@@ -573,6 +655,8 @@ class H(BaseHTTPRequestHandler):
             q = urllib.parse.parse_qs(u.query)
             jid = (q.get("id") or [""])[0]
             return self._send(200, json.dumps(JOBS.get(jid, {"stage": "unknown"}), ensure_ascii=False))
+        if u.path == "/diagnose":
+            return self._send(200, json.dumps(diagnose(), ensure_ascii=False))
         if u.path == "/engine/status":
             babeldoc_ready(force=True)
             return self._send(200, json.dumps(engine_status(), ensure_ascii=False))
