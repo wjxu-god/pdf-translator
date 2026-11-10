@@ -23,10 +23,26 @@ def base_dir():
 def env_python():
     p = base_dir()
     for c in (os.path.join(p, "env", "Scripts", "python.exe"),
-              os.path.join(p, "env", "bin", "python")):
+              os.path.join(p, "env", "bin", "python"),
+              os.path.join(p, "py311", "python.exe"),
+              os.path.join(p, "python", "python.exe")):
         if os.path.exists(c):
             return c
     return None
+
+
+def _has_venv(py):
+    """该解释器是否支持 venv（嵌入式包没有 venv 模块）。"""
+    if not py:
+        return False
+    try:
+        r = subprocess.run([py, "-c", "import venv, ensurepip; print(1)"],
+                           capture_output=True, text=True, timeout=60,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return "1" in (r.stdout or "")
+    except Exception:
+        return False
+
 
 def has_babeldoc():
     py = env_python()
@@ -186,78 +202,143 @@ def _run(cmd, log, cwd=None, timeout=3600):
     if p.returncode != 0:
         raise RuntimeError("命令失败(%d): %s" % (p.returncode, " ".join(cmd[:3])))
 
-def _download(url, dst, log=print, timeout=120):
+def _download(url, dst, log=print, timeout=60, max_seconds=600):
+    """下载文件；总时长超过 max_seconds 立即放弃（换下一个源）。"""
     import urllib.request
     log("  下载 %s" % url)
+    t0 = time.time()
+    got = 0
     with urllib.request.urlopen(url, timeout=timeout) as r, open(dst, "wb") as f:
         while True:
             chunk = r.read(1 << 16)
             if not chunk:
                 break
             f.write(chunk)
+            got += len(chunk)
+            if time.time() - t0 > max_seconds:
+                raise RuntimeError("下载超时（%.0f 秒仅 %.1fMB）" % (time.time() - t0, got / 1048576))
+    log("  完成 %.1fMB / %.0f 秒" % (got / 1048576, time.time() - t0))
     return dst
 
 
 def ensure_python(log=print):
-    """返回可用的 Python 命令；没有就自动下载官方便携版（无需用户装 Python）。"""
+    """返回可用的 Python 命令。优先用系统 Python；没有就静默安装一份官方版；再不行用嵌入式。"""
     py = _sys_python()
     if py:
         return py
 
     base = base_dir()
+    os.makedirs(base, exist_ok=True)
+
+    # 已有可用解释器（之前装过）
+    for cand in (os.path.join(base, "py311", "python.exe"),
+                 os.path.join(base, "python", "python.exe")):
+        if os.path.exists(cand) and _has_venv(cand):
+            return cand
+
+    # 方案 A：下载官方安装包，静默安装到 base\py311（含 venv / pip，无需管理员）
+    target = os.path.join(base, "py311")
+    exe_new = os.path.join(target, "python.exe")
+    if not os.path.exists(exe_new):
+        log("未找到系统 Python，自动安装官方 Python 3.11（约 25MB，无需管理员）…")
+        inst = os.path.join(base, "python-3.11.9-amd64.exe")
+        urls = [
+            "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe",
+            "https://mirrors.huaweicloud.com/python/3.11.9/python-3.11.9-amd64.exe",
+        ]
+        for u in urls:
+            try:
+                _download(u, inst, log=log, timeout=300)
+                break
+            except Exception as e:
+                log("  镜像失败：%r" % (e,))
+        if os.path.exists(inst):
+            log("  静默安装到 %s" % target)
+            cmd = [inst, "/quiet", "InstallAllUsers=0", "TargetDir=" + target,
+                   "Include_pip=1", "Include_launcher=0", "Include_test=0",
+                   "AssociateFiles=0", "Shortcuts=0", "PrependPath=0"]
+            try:
+                subprocess.run(cmd, timeout=1800,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except Exception as e:
+                log("  安装器执行失败：%r" % (e,))
+            if os.path.exists(exe_new) and _has_venv(exe_new):
+                log("Python 3.11 就绪：%s" % exe_new)
+                return exe_new
+            log("  官方安装包未成功，改用嵌入式便携版")
+
+    # 方案 B：嵌入式便携版（没有 venv，直接用它装依赖）
     emb = os.path.join(base, "python")
     exe = os.path.join(emb, "python.exe")
-    if os.path.exists(exe):
-        return exe
-
-    log("未找到系统 Python，自动下载官方便携版（约 11MB）…")
-    os.makedirs(emb, exist_ok=True)
-    zpath = os.path.join(base, "python-embed.zip")
-    mirrors = [
-        "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip",
-        "https://mirrors.huaweicloud.com/python/3.11.9/python-3.11.9-embed-amd64.zip",
-    ]
-    ok = False
-    for u in mirrors:
+    if not os.path.exists(exe):
+        log("下载嵌入式 Python（约 11MB）…")
+        os.makedirs(emb, exist_ok=True)
+        zpath = os.path.join(base, "python-embed.zip")
+        mirrors = [
+            "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip",
+            "https://mirrors.huaweicloud.com/python/3.11.9/python-3.11.9-embed-amd64.zip",
+        ]
+        ok = False
+        for u in mirrors:
+            try:
+                _download(u, zpath, log=log)
+                import zipfile
+                with zipfile.ZipFile(zpath) as z:
+                    z.extractall(emb)
+                ok = True
+                break
+            except Exception as e:
+                log("  镜像失败：%r" % (e,))
+        if not ok:
+            raise RuntimeError("自动准备 Python 失败（网络受限）。请手动安装 Python 3.10~3.12 后重试。")
+        # 修正 ._pth：真正启用 site，并把 Lib\site-packages 加入搜索路径
+        # （原来只判断 "import site" in txt，而文件里是 "#import site"，导致永远不生效）
+        for n in os.listdir(emb):
+            if n.endswith("._pth"):
+                pth = os.path.join(emb, n)
+                raw_lines = [x.strip() for x in open(pth, encoding="utf-8").read().splitlines()]
+                out = []
+                site_on = False
+                for x in raw_lines:
+                    if x == "#import site":
+                        out.append("import site"); site_on = True
+                    elif x == "import site":
+                        out.append(x); site_on = True
+                    else:
+                        out.append(x)
+                if not any(y.lower() == "lib\\site-packages" for y in out):
+                    out.insert(1, "Lib\\site-packages")
+                if not site_on:
+                    out.append("import site")
+                open(pth, "w", encoding="utf-8", newline="\r\n").write("\r\n".join(out) + "\r\n")
+                log("  已修正 %s：%s" % (n, " | ".join(out)))
+                break
         try:
-            _download(u, zpath, log=log)
-            import zipfile
-            with zipfile.ZipFile(zpath) as z:
-                z.extractall(emb)
-            ok = True
-            break
+            gp = os.path.join(base, "get-pip.py")
+            _download(GET_PIP_URL, gp, log=log)
+            subprocess.run([exe, gp, "--no-warn-script-location"], check=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except Exception as e:
-            log("  镜像失败：%r" % (e,))
-    if not ok:
-        raise RuntimeError("自动下载 Python 失败（网络受限）。请手动安装 Python 3.10~3.12 后重试。")
-
-    # 便携版默认不能 import site / pip，需要放开
-    for n in os.listdir(emb):
-        if n.endswith("._pth"):
-            p = os.path.join(emb, n)
-            txt = open(p, encoding="utf-8").read()
-            if "import site" not in txt:
-                txt = txt.replace("#import site", "import site")
-                if "import site" not in txt:
-                    txt += "\nimport site\n"
-                open(p, "w", encoding="utf-8").write(txt)
-            break
-
-    # 装 pip
-    try:
-        gp = os.path.join(base, "get-pip.py")
-        _download(GET_PIP_URL, gp, log=log)
-        subprocess.run([exe, gp, "--no-warn-script-location"], check=True,
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except Exception as e:
-        log("  pip 安装失败：%r" % (e,))
-    log("便携版 Python 就绪：%s" % exe)
+            log("  pip 安装失败：%r" % (e,))
+    log("嵌入式 Python 就绪：%s" % exe)
     return exe
+
+
+def _cleanup_broken_env(base, log=print):
+    """清理上次失败留下的半成品（例如只有嵌入式 python、没有 venv）。"""
+    import shutil as _sh
+    for folder in (os.path.join(base, "env"), os.path.join(base, "python")):
+        exe = os.path.join(folder, "Scripts", "python.exe") if folder.endswith("env") \
+            else os.path.join(folder, "python.exe")
+        if os.path.isdir(folder) and os.path.exists(exe) and not _has_venv(exe):
+            log("  清理不可用的环境：%s" % folder)
+            _sh.rmtree(folder, ignore_errors=True)
 
 
 def install_babeldoc(log=print, progress=None):
     base = base_dir()
     os.makedirs(base, exist_ok=True)
+    _cleanup_broken_env(base, log)
     py = ensure_python(log)   # 系统没有 Python 时自动下载官方便携版
 
     def step(pct, msg):
@@ -265,13 +346,21 @@ def install_babeldoc(log=print, progress=None):
             progress(pct, msg)
         log("== " + msg)
 
-    step(5, "创建独立运行环境（venv）")
+    # 能用 venv 就建独立环境；嵌入式解释器没有 venv，就直接装到它自己身上
     env_dir = os.path.join(base, "env")
-    if not os.path.exists(env_dir):
-        _run(py.split() + ["-m", "venv", env_dir], log)
-    vpy = env_python()
+    if _has_venv(py):
+        step(5, "创建独立运行环境（venv）")
+        if not os.path.exists(os.path.join(env_dir, "Scripts", "python.exe")):
+            try:
+                _run(py.split() + ["-m", "venv", env_dir], log)
+            except Exception as e:
+                log("venv 创建失败，改为直接安装到当前解释器：%r" % (e,))
+        vpy = env_python() or py
+    else:
+        step(5, "使用便携版 Python（无 venv，直接安装依赖）")
+        vpy = py
     if not vpy:
-        raise RuntimeError("venv 创建失败")
+        raise RuntimeError("未能准备 Python 运行环境")
 
     step(12, "升级 pip")
     try:

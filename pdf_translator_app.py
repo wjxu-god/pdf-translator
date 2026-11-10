@@ -22,7 +22,7 @@ JOBS = {}
 HISTORY = os.path.join(HERE, "历史记录.json")
 SETTINGS = os.path.join(HERE, "设置.json")
 APP_NAME = "PDF翻译专家"
-APP_VERSION = "1.2.8"
+APP_VERSION = "1.2.9"
 
 def load_settings():
     try:

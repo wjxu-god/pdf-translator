@@ -28,7 +28,8 @@ def _find_root():
 ROOT = _find_root()
 
 def _pick_python(root):
-    for rel in (("env", "Scripts", "python.exe"), ("env", "python.exe"), ("env", "bin", "python")):
+    for rel in (("env", "Scripts", "python.exe"), ("env", "python.exe"), ("env", "bin", "python"),
+                ("py311", "python.exe"), ("python", "python.exe")):
         p = os.path.join(root, *rel)
         if os.path.exists(p):
             return p
