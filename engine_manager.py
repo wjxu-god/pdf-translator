@@ -140,6 +140,12 @@ def install_babeldoc(log=print, progress=None):
     except Exception as e:
         log("EI 补丁未应用（不影响大多数 PDF）：%r" % (e,))
 
+    step(91, "把资源下载源改为国内可用（modelscope 优先）")
+    try:
+        install_asset_upstream_patch(log=log)
+    except Exception as e:
+        log("资源上游补丁未应用：%r" % (e,))
+
     step(92, "安装腾讯免费翻译引擎")
     try:
         install_tencent(log=log)
@@ -319,6 +325,108 @@ def install_ei_patch(log=print):
         raise RuntimeError("补丁后语法校验失败，已回滚：%r" % (e,))
     log("EI 补丁已应用（备份 %s）" % os.path.basename(bak))
     return True
+
+
+
+ASSET_PATCH_MARK = "# --- PDF翻译专家: 字体/资源上游改为国内可用优先 ---"
+
+ASSET_PATCH_CODE = '''
+
+# --- PDF翻译专家: 字体/资源上游改为国内可用优先 ---
+# 原版只列 github/huggingface/modelscope，hf-mirror 被注释掉；国内网络下前两个常失败，
+# 会导致字体下载不到，排版出现文字重叠。
+_PREF_UPSTREAM = ["modelscope", "hf-mirror", "github", "huggingface"]
+
+if "hf-mirror" not in FONT_METADATA_URL:
+    FONT_METADATA_URL["hf-mirror"] = (
+        "https://hf-mirror.com/datasets/awwaawwa/BabelDOC-Assets/resolve/main/"
+        "font_metadata.json?download=true"
+    )
+    FONT_URL_BY_UPSTREAM["hf-mirror"] = (
+        lambda name: f"https://hf-mirror.com/datasets/awwaawwa/BabelDOC-Assets/resolve/main/fonts/{name}?download=true"
+    )
+    CMAP_URL_BY_UPSTREAM["hf-mirror"] = (
+        lambda name: f"https://hf-mirror.com/datasets/awwaawwa/BabelDOC-Assets/resolve/main/cmap/{name}?download=true"
+    )
+
+FONT_METADATA_URL = {k: FONT_METADATA_URL[k] for k in _PREF_UPSTREAM if k in FONT_METADATA_URL}
+FONT_URL_BY_UPSTREAM = {k: FONT_URL_BY_UPSTREAM[k] for k in _PREF_UPSTREAM if k in FONT_URL_BY_UPSTREAM}
+CMAP_URL_BY_UPSTREAM = {k: CMAP_URL_BY_UPSTREAM[k] for k in _PREF_UPSTREAM if k in CMAP_URL_BY_UPSTREAM}
+'''
+
+
+def install_asset_upstream_patch(log=print):
+    """把 babeldoc 的字体/资源下载上游改成 modelscope 优先（国内可达）。"""
+    base = base_dir()
+    site = _site_packages(base)
+    if not site:
+        raise RuntimeError("未找到 site-packages")
+    target = os.path.join(site, "babeldoc", "assets", "embedding_assets_metadata.py")
+    if not os.path.isfile(target):
+        raise RuntimeError("未找到 babeldoc 资源元数据文件")
+    src = open(target, encoding="utf-8").read()
+    if ASSET_PATCH_MARK in src:
+        log("资源上游补丁已存在，跳过")
+        return True
+    bak = target + ".bak-" + time.strftime("%Y%m%d-%H%M%S")
+    shutil.copyfile(target, bak)
+    open(target, "w", encoding="utf-8").write(src + ASSET_PATCH_CODE)
+    try:
+        import py_compile
+        py_compile.compile(target, doraise=True)
+    except Exception as e:
+        shutil.copyfile(bak, target)
+        raise RuntimeError("补丁后语法校验失败，已回滚：%r" % (e,))
+    log("资源上游已改为 modelscope 优先（备份 %s）" % os.path.basename(bak))
+    return True
+
+
+def fonts_ready():
+    """检查 babeldoc 字体缓存是否已就绪。"""
+    cache = os.path.join(os.path.expanduser("~"), ".cache", "babeldoc", "fonts")
+    try:
+        return any(n.lower().endswith((".ttf", ".otf", ".ttc")) for n in os.listdir(cache))
+    except Exception:
+        return False
+
+
+def ensure_assets(log=print, timeout=900):
+    """确保字体资源可用：缺失时用 babeldoc 自身流程预下载（已改成国内上游优先）。"""
+    if fonts_ready():
+        return True
+    base = base_dir()
+    py = env_python()
+    if not py:
+        return False
+    log("检测到字体资源缺失，开始下载（modelscope 优先，约 30MB）…")
+    try:
+        import tempfile
+        warm = os.path.join(tempfile.mkdtemp(prefix="fontwarm_"), "w.pdf")
+        try:
+            import pymupdf
+            d = pymupdf.open(); pg = d.new_page()
+            pg.insert_text((40, 80), "Warmup for fonts.", fontsize=14, fontname="helv")
+            d.save(warm); d.close()
+        except Exception:
+            import shutil as _sh
+            _sh.copyfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), "warmup.pdf"), warm)
+        env2 = dict(os.environ)
+        env2["PYTHONIOENCODING"] = "utf-8"
+        p = subprocess.Popen([py, "-c", "from pdf2zh_next.main import cli; cli()", warm,
+                              "--output", os.path.join(base, "warmup_out"),
+                              "--lang-in", "en", "--lang-out", "zh", "--bing"],
+                             cwd=base, env=env2, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, encoding="utf-8", errors="replace",
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        for line in p.stdout:
+            if line.strip():
+                log(line.rstrip()[:180])
+        p.wait()
+    except Exception as e:
+        log("资源下载异常：%r" % (e,))
+    ok = fonts_ready()
+    log("字体资源就绪" if ok else "字体资源仍缺失（排版可能出现重叠）")
+    return ok
 
 
 def install_tencent(log=print):

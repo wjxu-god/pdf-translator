@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """BabelDOC 引擎适配器：调用本机 PDF_Translator 的 pdf2zh_next（排版质量最好）"""
-import glob, os, re, shutil, subprocess, sys, tempfile, time
+import glob, json, os, re, shutil, subprocess, sys, tempfile, time, urllib.request
 
 def _find_root():
     """BabelDOC 运行环境位置：优先环境变量 PDF2ZH_HOME，其次常见安装位置。"""
@@ -140,6 +140,128 @@ def _unwrap(text):
     return out
 
 
+WIN_LIMIT = 240
+
+
+def _long_path(p):
+    """Windows 长路径前缀，避免 MAX_PATH(260) 限制导致写文件失败。"""
+    p = os.path.abspath(p)
+    if os.name != "nt":
+        return p
+    if p.startswith("\\\\?\\"):
+        return p
+    return "\\\\?\\" + p if len(p) >= WIN_LIMIT else p
+
+
+def _copy(src, dst):
+    import shutil
+    shutil.copyfile(_long_path(src), _long_path(dst))
+    return dst
+
+
+def _write_bytes(path, data):
+    with open(_long_path(path), "wb") as fh:
+        fh.write(data)
+    return path
+
+
+def translate_texts(texts, src="en", tgt="zh", retries=3, batch=10):
+    """回填用的整段翻译（腾讯免费接口，按批提交，减少往返）。"""
+    out = list(texts)
+    idx = [i for i, t in enumerate(texts) if t and t.strip()]
+    for k in range(0, len(idx), batch):
+        chunk = idx[k:k + batch]
+        body = {
+            "header": {"client_key": CK, "fn": "auto_translation", "session": "", "user": ""},
+            "model_category": "normal",
+            "reference": {"sentence_lib": [], "term_lib": []},
+            "source": {"lang": src, "text_list": [texts[i] for i in chunk]},
+            "target": {"lang": tgt},
+            "type": "plain",
+        }
+        got = False
+        for i in range(retries):
+            try:
+                req = urllib.request.Request(API, data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json",
+                                                      "User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    j = json.loads(r.read().decode("utf-8", "replace"))
+                res = j.get("auto_translation") or []
+                if res:
+                    for n, t_i in enumerate(chunk):
+                        if n < len(res) and res[n]:
+                            out[t_i] = res[n]
+                    got = True
+                    break
+            except Exception:
+                time.sleep(1.0 * (i + 1))
+        if not got:
+            pass
+    return out
+
+
+def _translate_texts_legacy(texts, src="en", tgt="zh", retries=3):
+    out = []
+    for t in texts:
+        body = {
+            "header": {"client_key": "desktop-dfc543ff7c364da490db1ddd1cd74dc9",
+                       "fn": "auto_translation", "session": "", "user": ""},
+            "model_category": "normal",
+            "reference": {"sentence_lib": [], "term_lib": []},
+            "source": {"lang": src, "text_list": [t]},
+            "target": {"lang": tgt},
+            "type": "plain",
+        }
+        got = t
+        for i in range(retries):
+            try:
+                req = urllib.request.Request(API, data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json",
+                                                      "User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=40) as r:
+                    j = json.loads(r.read().decode("utf-8", "replace"))
+                res = j.get("auto_translation") or []
+                if res and res[0]:
+                    got = res[0]
+                    break
+            except Exception:
+                time.sleep(1.0 * (i + 1))
+        out.append(got)
+    return out
+
+
+def quality_metrics(src_path, out_path):
+    """翻译质量体检：引用保留率、兼容区汉字、页末空白。"""
+    import pymupdf, re as _re
+    m = {"cites_src": 0, "cites_out": 0, "compat_cjk": 0, "tail_blank_pages": 0}
+    try:
+        s = pymupdf.open(src_path)
+        o = pymupdf.open(out_path)
+        pat = _re.compile(r"\[\d{1,3}(?:[,]\s?\d{1,3})*\]")
+        for p in s:
+            m["cites_src"] += len(pat.findall(p.get_text()))
+        for p in o:
+            t = p.get_text()
+            m["cites_out"] += len(pat.findall(t))
+            m["compat_cjk"] += sum(1 for ch in t if 0xF900 <= ord(ch) <= 0xFAFF)
+            # 页末空白：最后一个文本块的底部到页底
+            blocks = [b for b in p.get_text("blocks") if b[4].strip()]
+            if blocks:
+                bottom = max(b[3] for b in blocks)
+                if (p.rect.y1 - bottom) / max(1.0, p.rect.y1) > 0.45:
+                    m["tail_blank_pages"] += 1
+        s.close()
+        o.close()
+    except Exception:
+        pass
+    if m["cites_src"]:
+        m["cite_ratio"] = round(m["cites_out"] / m["cites_src"], 2)
+    else:
+        m["cite_ratio"] = None
+    return m
+
+
 def _normalize_pdf(src_path, dst_path, log=print):
     """用 PyMuPDF 重写 PDF：修复内联图像等结构问题（BabelDOC 的 Rust 解析器对这类文件会直接失败）。"""
     try:
@@ -200,11 +322,26 @@ SERVICE_FLAGS = {"tencentfree": ["--tencentfree"],
                              "--openai-api-key", "sk-local",
                              "--openai-timeout", "60"]}
 
+def _ensure_fonts(log=print):
+    """字体缺失时先下载（否则中文字体回退，排版会重叠）。"""
+    try:
+        import engine_manager as em
+        if em.fonts_ready():
+            return True
+        log("  字体资源缺失，正在下载…")
+        return em.ensure_assets(log=log)
+    except Exception as e:
+        log("  字体检查跳过：%r" % (e,))
+        return False
+
+
 def translate(src_pdf, out_dir, src="en", tgt="zh", base_name=None, log=print, progress=None, service="bing"):
     if not available():
         raise RuntimeError("PDF_Translator 未安装：%s" % ROOT)
     if service == "tencent":
         ensure_shim(log)
+    _ensure_fonts(log)
+
     tmp = tempfile.mkdtemp(prefix="babeldoc_")
     log_path = os.path.join(tmp, "engine.log")
 
@@ -277,13 +414,64 @@ def translate(src_pdf, out_dir, src="en", tgt="zh", base_name=None, log=print, p
         raise RuntimeError("pdf2zh_next 未产出文件。" + hint + chr(10) + digest
                            + chr(10) + "完整日志：" + dump)
     os.makedirs(out_dir, exist_ok=True)
-    base = base_name or os.path.splitext(os.path.basename(src_pdf))[0]
+    base = (base_name or os.path.splitext(os.path.basename(src_pdf))[0])[:60]
     out_mono = os.path.join(out_dir, "%s_%s.pdf" % (base, tgt))
     out_dual = os.path.join(out_dir, "%s_%s_对照.pdf" % (base, tgt))
-    shutil.copyfile(mono[0], out_mono)
+    _copy(mono[0], out_mono)
+
+    def _post_progress(label, i, n):
+        if progress:
+            progress({"stage": label, "percent": 90 + int(9.0 * i / max(1, n)),
+                      "page": i, "pages": n})
+
+    # 修复 BabelDOC 因空间不足造成的段落截断
+    try:
+        import postfix
+        log("  检查段落截断…")
+        fixed, skipped = postfix.repair(norm, out_mono, translate_batch=translate_texts,
+                                        log=log, progress=_post_progress)
+        if skipped:
+            log("  !! %d 段因版面空间不足仍为截断" % skipped)
+        try:
+            filled = postfix.fill_missing(norm, out_mono, translate_batch=translate_texts,
+                                          log=log, progress=_post_progress)
+            if filled:
+                log("  .. 补回整段缺失 %d 处" % filled)
+        except Exception as e:
+            log("  补缺跳过：%r" % (e,))
+    except Exception as e:
+        log("  截断修复跳过：%r" % (e,))
+
+    # 最后清理 BabelDOC 画出的方块乱码（独立全量保存，确保生效）
+    try:
+        postfix.clean_artifacts(out_mono, log=log)
+    except Exception as e:
+        log("  乱码清理跳过：%r" % (e,))
+
+    # 参考文献 / 页眉页脚 恢复原文（这些不该翻译）
+    try:
+        postfix.restore_fixed_zones(norm, out_mono, log=log)
+    except Exception as e:
+        log("  原样区恢复跳过：%r" % (e,))
+
     if dual:
-        shutil.copyfile(dual[0], out_dual)
+        _copy(dual[0], out_dual)
     else:
         out_dual = None
+
+    metrics = {}
+    try:
+        metrics = quality_metrics(norm, out_mono)
+        log("  质量体检：引用 %s/%s（%s）、兼容区汉字 %s、页末大空白 %s 页"
+            % (metrics.get("cites_out"), metrics.get("cites_src"), metrics.get("cite_ratio"),
+               metrics.get("compat_cjk"), metrics.get("tail_blank_pages")))
+    except Exception as e:
+        log("  质量体检跳过：%r" % (e,))
+
     shutil.rmtree(tmp, ignore_errors=True)
-    return {"mono": out_mono, "dual": out_dual}
+    out = {"mono": out_mono, "dual": out_dual, "truncated": 0, "metrics": metrics}
+    try:
+        out["truncated"] = skipped
+    except Exception:
+        pass
+    return out

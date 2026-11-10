@@ -22,7 +22,7 @@ JOBS = {}
 HISTORY = os.path.join(HERE, "历史记录.json")
 SETTINGS = os.path.join(HERE, "设置.json")
 APP_NAME = "PDF翻译专家"
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.1.8"
 
 def load_settings():
     try:
@@ -58,8 +58,21 @@ def safe_name(name):
     name = name.strip(" .") or "document"
     return name[:80]
 
+def doc_folder_name(base_name):
+    """把文档名转成安全的文件夹名：按词边界截断 + 短哈希防重名。"""
+    import hashlib
+    s = safe_name(base_name)
+    if len(s) > 40:
+        cut = s[:40]
+        sp = cut.rfind(" ")
+        if sp > 20:
+            cut = cut[:sp]
+        s = cut.rstrip() + "-" + hashlib.md5(base_name.encode("utf-8")).hexdigest()[:4]
+    return s
+
+
 def doc_folder(base_name):
-    d = os.path.join(outdir(), safe_name(base_name))
+    d = os.path.join(outdir(), doc_folder_name(base_name))
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -217,6 +230,14 @@ def diagnose():
         add("就绪判断（界面用的）", False, repr(e))
 
     try:
+        import engine_manager as em2
+        cache = os.path.join(os.path.expanduser("~"), ".cache", "babeldoc", "fonts")
+        n = len(os.listdir(cache)) if os.path.isdir(cache) else 0
+        add("排版字体资源", em2.fonts_ready(), "%s（%d 个文件）" % (cache, n))
+    except Exception as e:
+        add("排版字体资源", False, repr(e))
+
+    try:
         import socket
         with socket.socket() as s:
             s.settimeout(2)
@@ -282,6 +303,7 @@ def run_job(job_id, name, raw, src, tgt, engine):
         os.makedirs(UPLOADS, exist_ok=True)
         base = os.path.splitext(name)[0] or "document"
         tgt_dir = doc_folder(base)
+        short = os.path.basename(tgt_dir)
         job.update({"folder": os.path.basename(tgt_dir)})
         tmp = os.path.join(tgt_dir, "_src.pdf")
         open(tmp, "wb").write(raw)
@@ -295,13 +317,29 @@ def run_job(job_id, name, raw, src, tgt, engine):
         def call_babeldoc(service):
             import pdf_engine_babeldoc as babeldoc_engine
             return babeldoc_engine.translate(
-                tmp, tgt_dir, src, tgt, base, log=log,
+                tmp, tgt_dir, src, tgt, short, log=log,
                 progress=lambda ev: job.update(ev), service=service)
 
         def finish(res):
             mono = os.path.join(os.path.basename(tgt_dir), os.path.basename(res["mono"]))
             dual = (os.path.join(os.path.basename(tgt_dir), os.path.basename(res["dual"]))
                     if res.get("dual") else None)
+            trunc = res.get("truncated") or 0
+            mt = res.get("metrics") or {}
+            if mt:
+                job["metrics"] = mt
+            bad = []
+            if mt.get("compat_cjk"):
+                bad.append("兼容区汉字 %d（复制/搜索会失效）" % mt["compat_cjk"])
+            if mt.get("cite_ratio") is not None and mt["cite_ratio"] < 0.9:
+                bad.append("引用标注保留率 %s" % mt["cite_ratio"])
+            if trunc:
+                bad.append("%d 段因空间不足被截断" % trunc)
+            if bad:
+                job.update({"warn": "质量提示：" + "；".join(bad) +
+                                    "。可点「用本地引擎重译」——学术论文用本地引擎在本项目实测："
+                                    "兼容区汉字 0、引用保留 0.96。"})
+            job["truncated"] = trunc
             job.update({"stage": "done", "percent": 100, "out": mono, "dual": dual,
                         "folder": os.path.basename(tgt_dir),
                         "engine_used": res.get("engine_used", job.get("engine_label", "")),
@@ -311,7 +349,8 @@ def run_job(job_id, name, raw, src, tgt, engine):
             except Exception:
                 pass
             add_history({"name": name, "out": mono, "dual": dual,
-                         "engine": job.get("engine_label", ""),
+                         "folder": os.path.basename(tgt_dir),
+                         "engine": job.get("engine_used", "") or res.get("engine_used", ""),
                          "time": time.strftime("%Y-%m-%d %H:%M")})
             log("done %s -> %s" % (name, mono))
 
@@ -372,7 +411,7 @@ def run_job(job_id, name, raw, src, tgt, engine):
         # local engine fallback
         job.update({"stage": "本地引擎处理", "percent": 5, "service": "local"})
         import pdf_translate
-        out_name = "%s_%s.pdf" % (base, tgt)
+        out_name = "%s_%s.pdf" % (short, tgt)
         out_path = os.path.join(tgt_dir, out_name)
         st = pdf_translate.translate_pdf(
             tmp, out_path, src, tgt, log=log,
@@ -386,12 +425,11 @@ def run_job(job_id, name, raw, src, tgt, engine):
                              if dual else None),
                     "folder": os.path.basename(tgt_dir),
                     "elapsed": int(time.time() - job.get("t0", time.time()))})
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
-        add_history({"name": name, "out": os.path.basename(out_path),
-                     "dual": os.path.basename(dual) if dual else None,
+        add_history({"name": name,
+                     "out": os.path.join(os.path.basename(tgt_dir), os.path.basename(out_path)),
+                     "dual": (os.path.join(os.path.basename(tgt_dir), os.path.basename(dual))
+                              if dual else None),
+                     "folder": os.path.basename(tgt_dir),
                      "engine": "本地引擎", "time": time.strftime("%Y-%m-%d %H:%M")})
     except Exception:
         job.update({"stage": "error", "error": traceback.format_exc()[-600:]})
@@ -402,6 +440,16 @@ HTML = r"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <title>PDF翻译专家</title>
 <style>
 :root{--bg:#0b1020;--card:#141b2e;--card2:#1a2338;--line:#26314d;--txt:#e9eefb;--dim:#8fa0c2;--blue:#4d8dff;--cyan:#5fd0ff}
+body[data-theme="forest"]{--bg:#0a1410;--card:#12201a;--card2:#16291f;--line:#23422f;--txt:#e7f5ec;--dim:#8fb8a2;--blue:#3fbf7f;--cyan:#7ff0b8}
+body[data-theme="violet"]{--bg:#120b1e;--card:#1c1430;--card2:#241a3c;--line:#3a2a5c;--txt:#f0e9ff;--dim:#a893c9;--blue:#9a6bff;--cyan:#c9a6ff}
+body[data-theme="light"]{--bg:#f5f7fb;--card:#ffffff;--card2:#f7f9fc;--line:#d8dfec;--txt:#1a2333;--dim:#5d6b85;--blue:#2f6dff;--cyan:#3fa9ff}
+body[data-theme="light"] #drop{background:#f7f9fc !important;color:#1a2333 !important;border-color:#c7d2e5 !important}
+body[data-theme="light"] #drop .big{color:#1a2333 !important}
+body[data-theme="light"] #drop .tip{color:#5d6b85 !important}
+body[data-theme="light"] .panel{box-shadow:0 1px 3px rgba(20,32,64,.06)}
+body[data-theme="light"] button.btn,body[data-theme="light"] a.btn{background:#eef2f9 !important;color:#1a2333 !important;border-color:#d8dfec !important}
+body[data-theme="light"] a.btn.primary{background:linear-gradient(90deg,#2f6dff,#3fa9ff) !important;color:#fff !important;border:none !important}
+body[data-theme="light"] #engLog{background:#f2f5fa !important;color:#3d4a63 !important}
 *{box-sizing:border-box}
 body{margin:0;background:radial-gradient(1200px 600px at 20% -10%,#16224a 0%,var(--bg) 55%);color:var(--txt);
  font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif;min-height:100vh}
@@ -418,39 +466,54 @@ select:focus{border-color:var(--blue)}
 input[type=text],input:not([type]){width:100%;background:var(--card2);color:var(--txt);border:1px solid var(--line);
  border-radius:10px;padding:10px 12px;font-size:13px;outline:none}
 .ver{font-size:12px;color:var(--dim);border:1px solid var(--line);border-radius:20px;padding:2px 9px;vertical-align:middle;margin-left:8px}
-#drop{border:2px dashed #33456b;border-radius:16px;padding:40px 18px;text-align:center;cursor:pointer;transition:.18s;background:#121a2c}
-#drop.hover{border-color:var(--blue);background:#16223a;transform:translateY(-1px)}
-#drop .big{font-size:16px;margin-bottom:6px}
+#drop{border:2px dashed rgba(140,160,200,.55);border-radius:16px;padding:40px 18px;text-align:center;cursor:pointer;transition:.18s;background:rgba(140,160,200,.10);color:var(--txt)}
+#drop.hover{border-color:var(--blue);background:var(--card);transform:translateY(-1px)}
+#drop .big{font-size:16px;margin-bottom:6px;color:var(--txt)}
 #drop .tip{font-size:12px;color:var(--dim)}
-#drop b{color:#8ab4ff}
+#drop:hover{border-color:var(--blue)}
+#drop b{color:var(--blue)}
 .files{margin-top:6px}
 .file{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:13px 15px;margin-bottom:10px}
 .file .top{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:9px}
 .file .nm{font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .file .st{font-size:12px;color:var(--dim);white-space:nowrap}
-.bar{height:9px;border-radius:5px;background:#0f1729;overflow:hidden}
+.bar{height:9px;border-radius:5px;background:var(--bg);overflow:hidden}
 .bar>i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--blue),var(--cyan));transition:width .35s}
 .file .meta{display:flex;justify-content:space-between;font-size:12px;color:var(--dim);margin-top:7px}
 .dl{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
-a.btn,button.btn{display:inline-flex;align-items:center;gap:6px;background:#1d2b47;color:#cfe2ff;border:1px solid #2f4a76;
+a.btn,button.btn{display:inline-flex;align-items:center;gap:6px;background:rgba(140,160,200,.14);color:var(--txt);border:1px solid rgba(140,160,200,.35);
  border-radius:9px;padding:7px 12px;font-size:13px;text-decoration:none;cursor:pointer;transition:.15s}
-a.btn:hover,button.btn:hover{background:#24406b;border-color:var(--blue)}
+a.btn:hover,button.btn:hover{background:var(--card);border-color:var(--blue)}
 a.primary{background:linear-gradient(90deg,#2f6dff,#3fa9ff);border:none;color:#04122b;font-weight:600}
 .foot{display:flex;justify-content:space-between;align-items:center;color:var(--dim);font-size:12px;margin-top:18px}
 .badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;border:1px solid var(--line);color:var(--dim)}
 .badge.ok{color:#7ee0a8;border-color:#2b5a44;background:#10241b}
 .badge.no{color:#ff9b9b;border-color:#5b2a2a;background:#241212}
 .err{color:#ff9b9b;font-size:12px;margin-top:8px;white-space:pre-wrap;max-height:120px;overflow:auto}
-button.danger{background:#2a1620;border-color:#5b2a3a;color:#ffb3c1}
-#engLog{font-family:Consolas,monospace}
+button.danger{background:rgba(200,60,90,.16);border-color:rgba(200,60,90,.45);color:#ff9fb3}
+button.btn,a.btn{color:var(--txt) !important}
+body[data-theme="light"] button.btn,body[data-theme="light"] a.btn{color:#1a2333 !important}
+body[data-theme="light"] button.danger{color:#b3243f !important}
+#engLog{font-family:Consolas,monospace;background:var(--card2);color:var(--dim)}
 button.danger:hover{background:#3d1e2b;border-color:#ff6b8b}
 #toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);opacity:0;
- background:#1d2b47;border:1px solid #2f4a76;color:#dceaff;padding:10px 16px;border-radius:10px;
+ background:var(--card2);border:1px solid var(--line);color:var(--txt);padding:10px 16px;border-radius:10px;
  font-size:13px;transition:.25s;pointer-events:none}
 #toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 </style></head><body>
 <div class="wrap">
-  <h1>PDF <span>翻译专家</span> <span class="ver">v__VERSION__</span></h1>
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
+    <h1>PDF <span>翻译专家</span> <span class="ver">v__VERSION__</span></h1>
+    <div style="display:flex;gap:8px;align-items:center">
+      <select id="theme" onchange="setTheme(this.value)" title="主题" style="width:auto;padding:6px 10px;font-size:12px">
+        <option value="ocean">深空蓝</option>
+        <option value="forest">森林绿</option>
+        <option value="violet">紫罗兰</option>
+        <option value="light">浅色</option>
+      </select>
+      <button class="btn" onclick="showGuide(0)">使用指南</button>
+    </div>
+  </div>
   <div class="sub">保排版翻译 · 段落重排 · 公式保留 · 双语对照 ｜ 全部在本机运行</div>
 
   <div class="panel">
@@ -509,11 +572,19 @@ button.danger:hover{background:#3d1e2b;border-color:#ff6b8b}
         <button class="btn" onclick="copyLog()">复制日志</button>
         <button class="btn" onclick="saveLog()">导出日志文件</button>
       </div>
-      <pre id="engLog" style="display:none;margin-top:8px;max-height:170px;overflow:auto;background:#0e1626;
-             border:1px solid var(--line);border-radius:10px;padding:10px;font-size:11.5px;color:#9fb2d0;
+      <pre id="engLog" style="display:none;margin-top:8px;max-height:170px;overflow:auto;background:var(--card2);
+             border:1px solid var(--line);border-radius:10px;padding:10px;font-size:11.5px;color:var(--dim);
              white-space:pre-wrap;user-select:text;cursor:text"></pre>
       </div>
     </details>
+  </div>
+
+  <div class="panel" id="histPanel" style="display:none">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <div class="lbl" style="margin:0">历史记录</div>
+      <button class="btn" onclick="clearHistory()">清空记录</button>
+    </div>
+    <div id="history"></div>
   </div>
 
   <div class="foot">
@@ -526,6 +597,34 @@ button.danger:hover{background:#3d1e2b;border-color:#ff6b8b}
 </div>
 
 <div id="toast"></div>
+
+<div id="guide" style="position:fixed;inset:0;background:rgba(4,8,18,.72);display:none;align-items:center;
+     justify-content:center;z-index:50">
+  <div style="width:560px;max-width:92vw;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px 26px">
+    <div id="guideStep" style="font-size:12px;color:var(--dim);margin-bottom:8px"></div>
+    <div id="guideTitle" style="font-size:18px;margin-bottom:10px"></div>
+    <div id="guideBody" style="font-size:13.5px;line-height:1.9;color:var(--txt)"></div>
+    <div style="display:flex;justify-content:space-between;margin-top:20px">
+      <button class="btn" onclick="closeGuide()">跳过</button>
+      <div style="display:flex;gap:8px">
+        <button class="btn" id="guidePrev" onclick="showGuide(-1)">上一步</button>
+        <button class="btn primary" id="guideNext" onclick="showGuide(1)">下一步</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="quality" style="position:fixed;inset:0;background:rgba(4,8,18,.72);display:none;align-items:center;
+     justify-content:center;z-index:50">
+  <div style="width:560px;max-width:92vw;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:24px 26px">
+    <div style="font-size:18px;margin-bottom:10px">这次排版引擎有几处不足</div>
+    <div id="qualityBody" style="font-size:13.5px;line-height:1.9;color:var(--txt)"></div>
+    <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:20px">
+      <button class="btn" onclick="closeQuality()">先这样</button>
+      <button class="btn primary" id="qualityRetry" onclick="retryFromQuality()">用本地引擎对比</button>
+    </div>
+  </div>
+</div>
 <script>
 function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');
  clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),2200);}
@@ -549,12 +648,120 @@ drop.addEventListener('drop',ev=>{ const fs=[...ev.dataTransfer.files].filter(f=
 const queueList=[];
 let running=false;
 
+const GUIDE_STEPS = [
+  {t:'把 PDF 拖进来', b:'把要翻译的 PDF 直接拖到虚线框，或点击选择文件。<br>支持一次拖多个，会排队一个一个处理。'},
+  {t:'选引擎（默认「自动」就行）', b:'『自动』= 先 Bing，失败换腾讯，再不行用本地引擎。<br>想排版更好：先装 BabelDOC（下一步讲），再选「BabelDOC + 腾讯 / Bing」。'},
+  {t:'看结果、打开文件夹', b:'完成后卡片上有三个按钮：下载纯译文、下载对照版、打开文件夹。<br>每篇文档的产物单独放在「输出目录\\文档名\\」里。'},
+  {t:'（可选）安装 BabelDOC 引擎', b:'展开底部「高级：翻译引擎组件」→ 点「安装 BabelDOC」。<br>约 400MB，走国内镜像，3~15 分钟；装完自动可用，不需要命令行。<br>不装也能用本地引擎，只是排版更朴素。'},
+  {t:'关于译文质量', b:'学术论文这类排版很紧的文档，BabelDOC 可能截断段落或丢失引用。<br>完成后会弹窗提示，并可一键「用本地引擎对比」。<br>参考文献一直是保留原文的，不翻译。'}
+];
+let guideIdx = 0;
+function showGuide(step){
+  if(step === 0){ guideIdx = 0; }
+  else { guideIdx = Math.max(0, Math.min(GUIDE_STEPS.length-1, guideIdx + step)); }
+  const s = GUIDE_STEPS[guideIdx];
+  document.getElementById('guideStep').textContent = '第 ' + (guideIdx+1) + ' / ' + GUIDE_STEPS.length + ' 步';
+  document.getElementById('guideTitle').textContent = s.t;
+  document.getElementById('guideBody').innerHTML = s.b;
+  document.getElementById('guidePrev').style.visibility = guideIdx === 0 ? 'hidden' : 'visible';
+  document.getElementById('guideNext').textContent = guideIdx === GUIDE_STEPS.length-1 ? '开始使用' : '下一步';
+  document.getElementById('guide').style.display = 'flex';
+  if(guideIdx === GUIDE_STEPS.length-1){
+    document.getElementById('guideNext').onclick = function(){ closeGuide(); };
+  } else {
+    document.getElementById('guideNext').onclick = function(){ showGuide(1); };
+  }
+}
+function closeGuide(){
+  document.getElementById('guide').style.display = 'none';
+  saveSetting({onboarded: 1});
+}
+function setTheme(name){
+  applyTheme(name);
+  saveSetting({theme: name});
+}
+function applyTheme(name){
+  name = name || 'ocean';
+  document.body.setAttribute('data-theme', name);
+  const light = (name === 'light');
+  const log = document.getElementById('engLog');
+  if (log) {
+    log.style.background = light ? '#f2f5fa' : '';
+    log.style.color = light ? '#3d4a63' : '';
+  }
+}
+
+let qualityFolder = null, qualityName = null;
+function showQuality(j, card){
+  qualityFolder = j.folder || '';
+  qualityName = j.name || '';
+  const m = j.metrics || {};
+  let lines = [];
+  if(m.cite_ratio !== undefined && m.cite_ratio !== null && m.cite_ratio < 0.9){
+    lines.push('· 引用标注保留 ' + (m.cites_out||0) + '/' + (m.cites_src||0) + '（有丢失）');
+  }
+  if(m.compat_cjk){ lines.push('· ' + m.compat_cjk + ' 个汉字落在兼容区（复制/搜索会失效）'); }
+  if(j.truncated){ lines.push('· ' + j.truncated + ' 段因版面空间不足被截断'); }
+  if(!lines.length) return;
+  document.getElementById('qualityBody').innerHTML =
+    lines.join('<br>') +
+    '<br><br>建议再跑一遍「本地引擎」做对比：本地引擎会重新排版，内容更完整（版式略朴素）。' +
+    '<br>两份结果都会保留，你挑满意的用。';
+  document.getElementById('quality').style.display = 'flex';
+}
+function closeQuality(){ document.getElementById('quality').style.display = 'none'; }
+function retryFromQuality(){
+  closeQuality();
+  fetch('/retry-local',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({folder:qualityFolder})}).then(r=>r.json()).then(j=>{
+      toast(j.error ? j.error : '已用本地引擎重新排队');
+    }).catch(()=>toast('提交失败'));
+}
+
+function saveSetting(patch){
+  fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(patch)}).catch(()=>{});
+}
+
+function refreshHistory(){
+  fetch('/history').then(r=>r.json()).then(list=>{
+    const box=document.getElementById('history'), panel=document.getElementById('histPanel');
+    if(!list || !list.length){ panel.style.display='none'; return; }
+    panel.style.display='block';
+    box.innerHTML = list.slice(0,20).map(it=>{
+      const ok = it.exists;
+      const name = (it.name||'').replace(/[<>&"]/g,'');
+      let btns='';
+      if(ok && it.out) btns+='<a class="btn" href="/file?name='+encodeURIComponent(it.out)+'">下载</a> ';
+      if(ok && it.folder) btns+='<button class="btn" onclick="openFolder(\''+String(it.folder).replace(/'/g,'')+'\')">文件夹</button>';
+      if(!ok) btns='<span style="color:#ff9b9b;font-size:12px">文件已删除</span>';
+      return '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 0;border-top:1px solid #1e2a42">'+
+        '<div style="min-width:0"><div style="font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+name+'</div>'+
+        '<div style="font-size:11px;color:#7c8aa8">'+(it.engine||'')+' · '+(it.time||'')+'</div></div>'+
+        '<div style="white-space:nowrap">'+btns+'</div></div>';
+    }).join('');
+  }).catch(()=>{});
+}
+function clearHistory(){
+  if(!confirm('清空历史记录？（不会删除译文文件）')) return;
+  fetch('/history/clear',{method:'POST'}).then(()=>{toast('已清空');refreshHistory();}).catch(()=>{});
+}
 function refreshSettings(){
   fetch('/settings').then(r=>r.json()).then(s=>{
     const el=document.getElementById('outdir'); if(el) el.value=s.outdir||'';
   }).catch(()=>{});
 }
 function openDir(){ fetch('/open',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).catch(()=>{}); }
+function retryLocal(btn, folder){
+  toast('已用本地引擎重新排队，请稍候');
+  btn.disabled = true;
+  fetch('/retry-local',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({folder:decodeURIComponent(folder)})}).then(r=>r.json()).then(j=>{
+      if(j.error){ toast(j.error); btn.disabled=false; return; }
+      toast('已提交：'+(j.name||''));
+      setTimeout(refreshHistory, 3000);
+    }).catch(()=>{ toast('提交失败'); btn.disabled=false; });
+}
 function openFolder(name){
   fetch('/open',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({name:name})}).then(r=>r.json()).then(j=>{
@@ -577,6 +784,12 @@ function setDir(p){
 }
 refreshSettings();
 refreshEngine();
+fetch('/settings').then(r=>r.json()).then(s=>{
+  applyTheme(s.theme);
+  document.getElementById('theme').value = s.theme || 'ocean';
+  if(!s.onboarded) showGuide(0);
+}).catch(()=>{});
+refreshHistory();
 let engTimer=null;
 function refreshEngine(){
   fetch('/engine/status').then(r=>r.json()).then(s=>{
@@ -724,6 +937,24 @@ function pump(){
   r.readAsDataURL(job.file);
 }
 
+const TIPS = [
+  '正在解析 PDF 版面…',
+  '正在识别段落与双栏结构…',
+  '正在切分句子，准备送翻译…',
+  '正在逐段翻译，保持上下文…',
+  '正在处理公式与符号…',
+  '正在把译文塞回原来的位置…',
+  '正在微调字号，让它刚好贴合段落…',
+  '正在检查有没有漏翻的段落…',
+  '正在生成双语对照版…',
+  '快好了，正在收尾…',
+  '大文件确实需要一点时间，请稍候…'
+];
+function tipFor(elapsedSec){
+  const i = Math.floor(elapsedSec / 6) % TIPS.length;
+  return TIPS[i];
+}
+
 function poll(id, job){
   const st=job.card.querySelector('.st'), fill=job.card.querySelector('.bar>i'),
         ph=job.card.querySelector('.ph'), sv=job.card.querySelector('.sv');
@@ -732,27 +963,46 @@ function poll(id, job){
     if(!p && j.pages && j.page) p=Math.min(99,Math.round(100*j.page/j.pages));
     fill.style.width=p+'%'; ph.textContent=p+'%';
     if(j.stage==='done'){
-      st.textContent='完成 · '+Math.round(j.elapsed||0)+' 秒'+(j.engine_used?(' · '+j.engine_used):'');
+      let mtxt = '';
+      if(j.metrics){
+        const m = j.metrics;
+        mtxt = ' · 引用 ' + (m.cites_out||0) + '/' + (m.cites_src||0);
+        if(m.compat_cjk) mtxt += ' · 兼容区 ' + m.compat_cjk;
+      }
+      st.textContent='完成 · '+Math.round(j.elapsed||0)+' 秒'+(j.engine_used?(' · '+j.engine_used):'')+mtxt;
       sv.textContent='';
       let html='<div class="dl">';
       if(j.out)  html+='<a class="btn primary" href="/file?name='+encodeURIComponent(j.out)+'">下载纯译文</a>';
       if(j.dual) html+='<a class="btn" href="/file?name='+encodeURIComponent(j.dual)+'">下载对照版</a>';
       if(j.folder) html+='<button class="btn" onclick="openFolder(\''+j.folder.replace(/'/g,"")+'\')">打开文件夹</button>';
       html+='</div>';
+      if(j.warn || j.metrics){ showQuality({folder:j.folder,name:job.file&&job.file.name,metrics:j.metrics,truncated:j.truncated}, job.card); }
+      if(j.warn){
+        html += '<div class="err" style="margin-top:8px;color:#ffd88a">'+escapeHtml(j.warn)+
+                ' <button class="btn" style="margin-left:6px" onclick="retryLocal(this,\''+
+                encodeURIComponent(j.folder||'')+'\')">用本地引擎重译</button></div>';
+      }
       job.card.insertAdjacentHTML('beforeend', html);
-      running=false; pump(); return;
+      running=false; pump(); refreshHistory(); return;
     }
     if(j.stage==='error'){
       st.textContent='失败';
       job.card.insertAdjacentHTML('beforeend','<div class="err">'+escapeHtml(j.error||'')+'</div>');
       running=false; pump(); return;
     }
-    st.textContent=j.stage||'处理中';
-    let extra='';
-    if(j.service) extra=j.service;
-    if(j.pages) extra+=' · '+j.page+'/'+j.pages;
-    sv.textContent=extra;
-    setTimeout(()=>poll(id,job),700);
+    const el = Math.round((Date.now() - (job._t0 || (job._t0 = Date.now()))) / 1000);
+    if(!job._t0) job._t0 = Date.now();
+    const stage = j.stage || '处理中';
+    st.textContent = (stage === '处理中' || stage === '翻译与回填' || stage === '翻译段落')
+      ? tipFor(el)
+      : stage + ' · ' + tipFor(el);
+    let extra = [];
+    if(j.service) extra.push(j.service);
+    if(j.pages) extra.push(j.page + '/' + j.pages);
+    if(j.percent) extra.push(j.percent + '%');
+    extra.push('已用 ' + el + ' 秒');
+    sv.textContent = extra.join(' · ');
+    setTimeout(()=>poll(id,job), 1200);
   });
 }
 </script></body></html>"""
@@ -797,9 +1047,22 @@ class H(BaseHTTPRequestHandler):
             s = load_settings()
             return self._send(200, json.dumps({
                 "outdir": outdir(), "default_outdir": OUTDIR, "version": APP_VERSION,
+                "theme": s.get("theme") or "ocean",
+                "onboarded": bool(s.get("onboarded")),
             }, ensure_ascii=False))
         if u.path == "/history":
-            return self._send(200, json.dumps(load_history(), ensure_ascii=False))
+            items = []
+            for it in load_history():
+                if it.get("folder") and it.get("out") and os.sep not in it["out"] and "/" not in it["out"]:
+                    it["out"] = os.path.join(it["folder"], it["out"])
+                folder = it.get("folder") or ""
+                out = it.get("out") or ""
+                p = os.path.join(outdir(), out) if out else ""
+                it = dict(it)
+                it["exists"] = bool(p and os.path.exists(p))
+                it["folder"] = folder or (os.path.dirname(out).split(os.sep)[0] if out else "")
+                items.append(it)
+            return self._send(200, json.dumps(items, ensure_ascii=False))
         if u.path == "/file":
             q = urllib.parse.parse_qs(u.query)
             rel = (q.get("name") or [""])[0].replace("\\", "/")
@@ -820,6 +1083,45 @@ class H(BaseHTTPRequestHandler):
         return self._send(404, "not found", "text/plain")
 
     def do_POST(self):
+        if self.path == "/retry-local":
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                d = json.loads(self.rfile.read(n).decode("utf-8"))
+                folder = (d.get("folder") or "").strip()
+                src = None
+                if folder:
+                    cand = os.path.join(outdir(), folder, "_src.pdf")
+                    if os.path.exists(cand):
+                        src = cand
+                if not src:
+                    for name in os.listdir(UPLOADS) if os.path.isdir(UPLOADS) else []:
+                        p = os.path.join(UPLOADS, name)
+                        if os.path.isfile(p) and folder and folder.split("-")[0][:18].lower() in name.lower():
+                            src = p
+                            break
+                if not src:
+                    return self._send(200, json.dumps({"error": "找不到原始 PDF，请重新拖入"},
+                                                      ensure_ascii=False))
+                data = open(src, "rb").read()
+                name = os.path.basename(src)
+                if name == "_src.pdf" and folder:
+                    name = folder + ".pdf"
+                job_id = uuid.uuid4().hex[:12]
+                JOBS[job_id] = {"stage": "排队中", "percent": 0, "name": name,
+                                "t0": time.time(), "page": 0, "pages": 0}
+                th = threading.Thread(target=run_job, args=(job_id, name, data, "en", "zh", "local"))
+                th.daemon = True
+                th.start()
+                return self._send(200, json.dumps({"ok": True, "name": name, "id": job_id},
+                                                  ensure_ascii=False))
+            except Exception as e:
+                return self._send(200, json.dumps({"error": str(e)}, ensure_ascii=False))
+        if self.path == "/history/clear":
+            try:
+                json.dump([], open(HISTORY, "w", encoding="utf-8"))
+            except Exception:
+                pass
+            return self._send(200, json.dumps({"ok": True}))
         if self.path == "/save-log":
             n = int(self.headers.get("Content-Length") or 0)
             try:
@@ -862,6 +1164,9 @@ class H(BaseHTTPRequestHandler):
             try:
                 d = json.loads(self.rfile.read(n).decode("utf-8"))
                 s = load_settings()
+                for k in ("theme", "onboarded"):
+                    if k in d:
+                        s[k] = d[k]
                 if d.get("outdir"):
                     v = str(d["outdir"]).strip()
                     if v:
