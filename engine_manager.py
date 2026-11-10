@@ -53,32 +53,120 @@ def has_tencent():
     except Exception:
         return False
 
+def _py_ok(cmd):
+    """校验候选解释器：必须是 3.10~3.12，且不是微软商店占位程序。"""
+    try:
+        if any("WindowsApps" in c for c in cmd):
+            return False
+        r = subprocess.run(cmd + ["-c", "import sys;print('%d.%d'%sys.version_info[:2])"],
+                           capture_output=True, text=True, timeout=20,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        ver = (r.stdout or "").strip()
+        return ver if re.match(r"^3\.(1[0-2])$", ver) else False
+    except Exception:
+        return False
+
+
+def _registry_pythons():
+    """从注册表读已安装的 Python（InstallPath / ExecutablePath）。"""
+    out = []
+    try:
+        import winreg
+        roots = [(winreg.HKEY_CURRENT_USER, r"Software\Python\PythonCore"),
+                 (winreg.HKEY_LOCAL_MACHINE, r"Software\Python\PythonCore"),
+                 (winreg.HKEY_LOCAL_MACHINE, r"Software\WOW6432Node\Python\PythonCore")]
+        for hive, path in roots:
+            try:
+                with winreg.OpenKey(hive, path) as k:
+                    i = 0
+                    while True:
+                        try:
+                            ver = winreg.EnumKey(k, i)
+                        except OSError:
+                            break
+                        i += 1
+                        for sub in (r"InstallPath",):
+                            try:
+                                with winreg.OpenKey(k, ver + "\\" + sub) as ip:
+                                    for val in ("ExecutablePath", None):
+                                        try:
+                                            v = winreg.QueryValueEx(ip, val)[0] if val else winreg.QueryValue(ip, None)
+                                        except Exception:
+                                            continue
+                                        if v and str(v).lower().endswith("python.exe"):
+                                            out.append([str(v)])
+                            except Exception:
+                                pass
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
 def _sys_python():
+    """尽最大努力找到可用 Python：PATH → py 启动器 → 注册表 → 常见安装目录。"""
     cands = []
-    for name in ("python.exe", "python"):
+    for name in ("python.exe", "python3.exe"):
         w = shutil.which(name)
         if w:
-            cands.append(w)
-    for v in ("-3.12", "-3.11", "-3.10"):
-        w = shutil.which("py")
-        if w:
-            cands.append(w + " " + v)
+            cands.append([w])
+    for p in (shutil.which("py"), r"C:\Windows\py.exe"):
+        if p:
+            for v in ("-3.12", "-3.11", "-3.10"):
+                cands.append([p, v])
+    cands += _registry_pythons()
+    local = os.environ.get("LOCALAPPDATA") or ""
+    pf = os.environ.get("ProgramFiles") or r"C:\Program Files"
+    for a, b in (("3", "12"), ("3", "11"), ("3", "10")):
+        ver = a + b
+        dot = a + "." + b
+        cands += [
+            [os.path.join(local, "Programs", "Python", "Python" + dot, "python.exe")],
+            [os.path.join(pf, "Python" + ver, "python.exe")],
+            [os.path.join(pf, "Python" + dot, "python.exe")],
+            ["C:\\Python" + ver + "\\python.exe"],
+        ]
+    seen = set()
     for c in cands:
-        try:
-            out = subprocess.run(c.split() + ["-c", "import sys;print('%d.%d'%sys.version_info[:2])"],
-                                 capture_output=True, text=True, timeout=30,
-                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            ver = (out.stdout or "").strip()
-            if re.match(r"^3\.(1[0-2])$", ver):
-                return c
-        except Exception:
+        key = " ".join(c).lower()
+        if key in seen:
             continue
+        seen.add(key)
+        if os.path.isabs(c[0]) and not os.path.exists(c[0]):
+            continue
+        ver = _py_ok(c)
+        if ver:
+            return " ".join(c) if len(c) > 1 else c[0]
     return None
+
 
 def status():
     return {"base": base_dir(), "python": env_python(),
             "babeldoc": has_babeldoc(), "tencent": has_tencent(),
             "sys_python": _sys_python()}
+
+def _run_with_progress(cmd, log, base_pct, top_pct, est_seconds=600, step_fn=None):
+    """跑一个耗时命令，同时按时间把进度从 base_pct 平滑推到 top_pct。"""
+    import threading
+    stop = threading.Event()
+
+    def ticker():
+        t0 = time.time()
+        while not stop.wait(2.0):
+            frac = min(1.0, (time.time() - t0) / max(30, est_seconds))
+            if step_fn:
+                step_fn(int(base_pct + (top_pct - base_pct) * frac), "下载依赖…")
+
+    th = threading.Thread(target=ticker, daemon=True)
+    th.start()
+    try:
+        _run(cmd, log)
+    finally:
+        stop.set()
+        if step_fn:
+            step_fn(top_pct, "依赖安装完成")
+
 
 def _run(cmd, log, cwd=None, timeout=3600):
     log("$ " + " ".join(cmd))
@@ -98,12 +186,79 @@ def _run(cmd, log, cwd=None, timeout=3600):
     if p.returncode != 0:
         raise RuntimeError("命令失败(%d): %s" % (p.returncode, " ".join(cmd[:3])))
 
+def _download(url, dst, log=print, timeout=120):
+    import urllib.request
+    log("  下载 %s" % url)
+    with urllib.request.urlopen(url, timeout=timeout) as r, open(dst, "wb") as f:
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk:
+                break
+            f.write(chunk)
+    return dst
+
+
+def ensure_python(log=print):
+    """返回可用的 Python 命令；没有就自动下载官方便携版（无需用户装 Python）。"""
+    py = _sys_python()
+    if py:
+        return py
+
+    base = base_dir()
+    emb = os.path.join(base, "python")
+    exe = os.path.join(emb, "python.exe")
+    if os.path.exists(exe):
+        return exe
+
+    log("未找到系统 Python，自动下载官方便携版（约 11MB）…")
+    os.makedirs(emb, exist_ok=True)
+    zpath = os.path.join(base, "python-embed.zip")
+    mirrors = [
+        "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip",
+        "https://mirrors.huaweicloud.com/python/3.11.9/python-3.11.9-embed-amd64.zip",
+    ]
+    ok = False
+    for u in mirrors:
+        try:
+            _download(u, zpath, log=log)
+            import zipfile
+            with zipfile.ZipFile(zpath) as z:
+                z.extractall(emb)
+            ok = True
+            break
+        except Exception as e:
+            log("  镜像失败：%r" % (e,))
+    if not ok:
+        raise RuntimeError("自动下载 Python 失败（网络受限）。请手动安装 Python 3.10~3.12 后重试。")
+
+    # 便携版默认不能 import site / pip，需要放开
+    for n in os.listdir(emb):
+        if n.endswith("._pth"):
+            p = os.path.join(emb, n)
+            txt = open(p, encoding="utf-8").read()
+            if "import site" not in txt:
+                txt = txt.replace("#import site", "import site")
+                if "import site" not in txt:
+                    txt += "\nimport site\n"
+                open(p, "w", encoding="utf-8").write(txt)
+            break
+
+    # 装 pip
+    try:
+        gp = os.path.join(base, "get-pip.py")
+        _download(GET_PIP_URL, gp, log=log)
+        subprocess.run([exe, gp, "--no-warn-script-location"], check=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception as e:
+        log("  pip 安装失败：%r" % (e,))
+    log("便携版 Python 就绪：%s" % exe)
+    return exe
+
+
 def install_babeldoc(log=print, progress=None):
     base = base_dir()
     os.makedirs(base, exist_ok=True)
-    py = _sys_python()
-    if not py:
-        raise RuntimeError("未找到可用的 Python 3.10~3.12。请先安装 Python（勾选 Add to PATH）后重试。")
+    py = ensure_python(log)   # 系统没有 Python 时自动下载官方便携版
 
     def step(pct, msg):
         if progress:
@@ -125,7 +280,9 @@ def install_babeldoc(log=print, progress=None):
         log("pip 升级失败，继续尝试")
 
     step(25, "安装 pdf2zh_next（约 300~500MB，视网络 3~15 分钟）")
-    _run([vpy, "-m", "pip", "install", "-i", MIRROR, "pdf2zh_next"], log, timeout=5400)
+    _run_with_progress([vpy, "-m", "pip", "install", "-i", MIRROR, "pdf2zh_next"],
+                       log, 25, 80, est_seconds=600,
+                       step_fn=lambda pct, msg: step(pct, msg))
 
     step(85, "写入默认配置")
     cfg_dir = os.path.join(base, "config")

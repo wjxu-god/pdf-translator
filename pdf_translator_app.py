@@ -22,7 +22,7 @@ JOBS = {}
 HISTORY = os.path.join(HERE, "历史记录.json")
 SETTINGS = os.path.join(HERE, "设置.json")
 APP_NAME = "PDF翻译专家"
-APP_VERSION = "1.1.8"
+APP_VERSION = "1.2.0"
 
 def load_settings():
     try:
@@ -568,6 +568,13 @@ button.danger:hover{background:#3d1e2b;border-color:#ff6b8b}
           </div>
         </div>
         <div id="engState" style="margin-top:8px"></div>
+        <div id="engBarWrap" style="display:none;margin-top:8px">
+          <div style="height:10px;border-radius:6px;background:rgba(140,160,200,.18);overflow:hidden">
+            <i id="engBar" style="display:block;height:100%;width:0;border-radius:6px;
+               background:linear-gradient(90deg,var(--blue),var(--cyan));transition:width .4s"></i>
+          </div>
+          <div id="engPct" style="font-size:12px;color:var(--dim);margin-top:6px"></div>
+        </div>
         <div id="logTools" style="display:none;margin-top:10px;gap:8px">
         <button class="btn" onclick="copyLog()">复制日志</button>
         <button class="btn" onclick="saveLog()">导出日志文件</button>
@@ -693,6 +700,9 @@ function applyTheme(name){
 
 let qualityFolder = null, qualityName = null;
 function showQuality(j, card){
+  if(card && card._qualityShown) return;
+  if(card) card._qualityShown = true;
+  if(document.getElementById('quality').style.display === 'flex') return;
   qualityFolder = j.folder || '';
   qualityName = j.name || '';
   const m = j.metrics || {};
@@ -789,6 +799,18 @@ fetch('/settings').then(r=>r.json()).then(s=>{
   document.getElementById('theme').value = s.theme || 'ocean';
   if(!s.onboarded) showGuide(0);
 }).catch(()=>{});
+// 首次启动：没装 BabelDOC 时直接问一句，省得用户去翻高级区
+setTimeout(function(){
+  fetch('/engine/status').then(r=>r.json()).then(s=>{
+    if(s.babeldoc || s.running) return;
+    if(sessionStorage.getItem('askedEngine')) return;
+    sessionStorage.setItem('askedEngine','1');
+    if(confirm('是否现在安装「BabelDOC 排版引擎」？\n\n· 装完后排版更接近原版、支持保留公式与图表\n· 约 400MB，走国内镜像，3~15 分钟\n· 没装 Python 也没关系，程序会自动下载便携版\n\n也可以先点「取消」，用本地引擎直接翻译。')){
+      installEngine('babeldoc');
+      document.getElementById('engDetails').open = true;
+    }
+  }).catch(()=>{});
+}, 1500);
 refreshHistory();
 let engTimer=null;
 function refreshEngine(){
@@ -809,6 +831,22 @@ function refreshEngine(){
     el.innerHTML='BabelDOC '+b+'　腾讯引擎 '+t+(s.base?('　<span style="color:#5b6b8c">'+s.base+'</span>'):'');
     document.getElementById('btnBabel').style.display = s.babeldoc?'none':'';
     const tools=document.getElementById('logTools');
+    const wrapBar = document.getElementById('engBarWrap');
+    if(wrapBar){
+      if(s.running){
+        wrapBar.style.display='block';
+        const p = s.percent || 0;
+        document.getElementById('engBar').style.width = p + '%';
+        document.getElementById('engPct').textContent =
+          (s.stage || '准备中') + ' · ' + p + '%';
+      } else if(s.done){
+        document.getElementById('engBar').style.width = '100%';
+        document.getElementById('engPct').textContent = '安装完成';
+        setTimeout(function(){ wrapBar.style.display='none'; }, 2500);
+      } else {
+        wrapBar.style.display='none';
+      }
+    }
     if(s.running || (s.lines && s.lines.length)){
       logEl.style.display='block'; if(tools) tools.style.display='flex';
       logEl.textContent=(s.lines||[]).join('\n');
@@ -816,7 +854,7 @@ function refreshEngine(){
     }
     if(s.error){ logEl.style.display='block'; logEl.textContent += '\n[错误] '+s.error; }
     if(s.running){
-      clearTimeout(engTimer); engTimer=setTimeout(refreshEngine,1500);
+      clearTimeout(engTimer); engTimer=setTimeout(refreshEngine,1000);
     } else if(s.done){
       clearTimeout(engTimer); engTimer=setTimeout(refreshEngine,4000);
       if(s.babeldoc){
@@ -895,7 +933,9 @@ function installEngine(kind){
   if(tip && !confirm(tip)) return;
   fetch('/engine/install',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({kind:kind})}).then(r=>r.json()).then(()=>{
-      toast('已开始：'+kind); refreshEngine();
+      toast('已开始：' + (kind === 'babeldoc' ? '安装 BabelDOC' : kind === 'tencent' ? '安装腾讯引擎' : '卸载'));
+      try { document.getElementById('engDetails').open = true; } catch(e){}
+      refreshEngine();
     }).catch(()=>toast('启动失败'));
 }
 
@@ -956,6 +996,8 @@ function tipFor(elapsedSec){
 }
 
 function poll(id, job){
+  if(job._polling) return;
+  job._polling = true;
   const st=job.card.querySelector('.st'), fill=job.card.querySelector('.bar>i'),
         ph=job.card.querySelector('.ph'), sv=job.card.querySelector('.sv');
   fetch('/status?id='+id).then(x=>x.json()).then(j=>{
