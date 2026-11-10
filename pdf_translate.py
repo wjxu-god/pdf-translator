@@ -413,70 +413,181 @@ def _apply(page, work, translated):
                 except Exception:
                     pass
 
-def translate_pdf(src_path, out_path, src="en", tgt="zh", log=print, progress=None, workers=6):
+class Control:
+    """暂停 / 继续 / 取消控制（按页粒度生效，并支持部分结果落盘）。"""
+    def __init__(self):
+        import threading
+        self.paused = False
+        self.cancelled = False
+        self._cv = threading.Condition()
+
+    def pause(self):
+        with self._cv:
+            self.paused = True
+
+    def resume(self):
+        with self._cv:
+            self.paused = False
+            self._cv.notify_all()
+
+    def cancel(self):
+        with self._cv:
+            self.cancelled = True
+            self.paused = False
+            self._cv.notify_all()
+
+    def checkpoint(self, log=None):
+        """每页开始前调用：暂停时阻塞，取消时返回 False。"""
+        import time
+        with self._cv:
+            if self.cancelled:
+                return False
+            if self.paused:
+                if log:
+                    log("  ⏸ 已暂停（可查看已完成的页面）")
+                while self.paused and not self.cancelled:
+                    self._cv.wait(0.5)
+                if self.cancelled:
+                    return False
+                if log:
+                    log("  ▶ 继续")
+        return True
+
+
+def _flush_partial(doc, out_path):
+    """把当前进度写盘，便于暂停时查看已完成页。"""
+    try:
+        tmp = out_path + ".partial"
+        doc.save(tmp, garbage=3, deflate=True)
+        import os
+        os.replace(tmp, out_path)
+        return True
+    except Exception:
+        return False
+
+
+def translate_pdf(src_path, out_path, src="en", tgt="zh", log=print, progress=None, workers=6,
+                  control=None, start_page=0):
+    """逐页流水：扫描 → 翻译 → 回填 → 落盘。支持暂停/继续/取消，暂停时已完成页可直接查看。"""
     import pymupdf
     import pymupdf4llm
+    from concurrent.futures import ThreadPoolExecutor
 
-    font = _font()   # 为空时回退到 PyMuPDF 内置 CJK 字体
-
-    doc = pymupdf.open(src_path)
+    font = _font()
+    # 续翻：以已有的部分结果为底稿
+    if start_page and os.path.exists(out_path):
+        try:
+            doc = pymupdf.open(out_path)
+            log("  从第 %d 页继续（已载入部分结果）" % (start_page + 1))
+        except Exception:
+            doc = pymupdf.open(src_path)
+            start_page = 0
+    else:
+        doc = pymupdf.open(src_path)
     try:
         chunks = pymupdf4llm.to_markdown(src_path, page_chunks=True)
     except Exception:
         chunks = None
 
-    # pass 1: scan / segment
-    pages = _collect(doc, chunks, log)
-    total = sum(len(p["work"]) for p in pages)
+    total_pages = len(doc)
+    if not start_page:
+        _flush_partial(doc, out_path)   # 先落盘一份，之后逐页覆盖
+    done_pages = start_page
+    boxes_total = 0
+    failed_total = 0
+    refs_mode = False
 
-    # pass 2: translate all paragraphs in parallel batches
-    flat = [(w["gid"], w["text"]) for p in pages for w in p["work"]]
-    results = {}
-    def batch_call(chunk):
-        texts = [t for _, t in chunk]
-        out, ok = translate_texts(texts, src, tgt)
-        for k, (gid, _) in enumerate(chunk):
-            if ok[k]:
-                results[gid] = out[k]
-    B = 16
-    groups = [flat[i:i + B] for i in range(0, len(flat), B)]
-    workers = min(max(1, workers), 3)
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-        list(ex.map(batch_call, groups))
+    for pno in range(start_page, total_pages):
+        if control and not control.checkpoint(log):
+            log("  ⏹ 已取消（完成 %d/%d 页）" % (done_pages, total_pages))
+            break
 
-    failed = [0]
-    # pass 3: apply per page
-    for pi, p in enumerate(pages):
-        page = doc[p["pno"]]
-        work = p["work"]
-        keep = [w for w in work if w["gid"] in results]
-        tr = [_fix_numbering(results[w["gid"]]) for w in keep]
-        missing = len(work) - len(keep)
-        if missing:
-            log("  page %d: %d boxes kept untranslated" % (p["pno"] + 1, missing))
-            failed[0] += missing
-        _apply(page, keep, tr)
-        log("  apply page %d/%d boxes=%d" % (p["pno"] + 1, len(doc), len(work)))
+        # --- 单页扫描 ---
+        page = doc[pno]
+        boxes = None
+        if chunks and pno < len(chunks):
+            boxes = chunks[pno].get("page_boxes")
+        if not boxes:
+            boxes = [{"bbox": b["bbox"], "class": "text"}
+                     for b in page.get_text("dict")["blocks"] if b.get("type") == 0]
+
+        texts_by_bbox = {}
+        for b in boxes:
+            try:
+                texts_by_bbox[tuple(round(v, 2) for v in b["bbox"])] = \
+                    _clean(page.get_textbox(pymupdf.Rect(b["bbox"])))
+            except Exception:
+                texts_by_bbox[tuple(round(v, 2) for v in b["bbox"])] = ""
+
+        work = []
+        kept = []
+        for b in boxes:
+            cls = (b.get("class") or "text").lower()
+            rect = pymupdf.Rect(b["bbox"])
+            raw = texts_by_bbox.get(tuple(round(v, 2) for v in b["bbox"]), "")
+            if cls == "section-header" and _is_refs_heading(raw):
+                refs_mode = True
+            if refs_mode or cls in SKIP_CLASSES:
+                continue
+            if rect.is_empty or rect.width < 4 or rect.height < 3:
+                continue
+            if any(_iou(rect, kr) > 0.6 for kr in kept):
+                continue
+            if cls == "table":
+                cells = _table_cells(page, rect)
+                if cells:
+                    for cr, txt in cells:
+                        work.append({"rect": tuple(cr), "text": txt, "cls": "table-cell",
+                                     "size": min(_box_fontsize(page, cr), 8.5), "color": 0})
+                    kept.append(rect)
+                    continue
+            kept.append(rect)
+            text = " ".join(_norm_math(_merge_inline(page, b["bbox"], boxes, texts_by_bbox)).split())
+            if len(text) < 2:
+                continue
+            work.append({"rect": tuple(rect), "text": text, "cls": cls,
+                         "size": _box_fontsize(page, rect), "color": _box_color(page, rect)})
+
+        if work:
+            boxes_total += len(work)
+            texts = [w["text"] for w in work]
+            tr, ok = translate_texts(texts, src, tgt)
+            keep_idx = [i for i in range(len(work)) if ok[i]]
+            failed_total += len(work) - len(keep_idx)
+            keep_work = [work[i] for i in keep_idx]
+            keep_tr = [_fix_numbering(tr[i]) for i in keep_idx]
+            _apply(page, keep_work, keep_tr)
+
+        done_pages += 1
+        _flush_partial(doc, out_path)      # 每页落盘：暂停时即可查看
         if progress:
-            progress(pi + 1, len(pages))
+            progress(done_pages, total_pages)
+        log("  page %d/%d boxes=%d" % (done_pages, total_pages, len(work)))
 
-    mono = out_path
     try:
         doc.subset_fonts()
     except Exception:
         pass
-    doc.save(mono, garbage=4, deflate=True, clean=True)
+    try:
+        tmp_out = out_path + ".final"
+        doc.save(tmp_out, garbage=4, deflate=True, clean=True)
+        import os as _os2
+        _os2.replace(tmp_out, out_path)
+    except Exception as e:
+        log("  !! 保存失败：%r" % (e,))
 
-    # bilingual: original page + translated page, interleaved
+    # 双语对照（左右并排）
     dual = None
     try:
         dual = out_path[:-4] + "_左右对照.pdf"
-        make_spread(src_path, mono, dual)
+        make_spread(src_path, out_path, dual)
     except Exception as e:
         log("  !! dual output failed: %r" % (e,))
 
     doc.close()
-    return {"pages": len(pages), "boxes": total, "failed": failed[0], "out": mono, "dual": dual}
+    return {"pages": done_pages, "boxes": boxes_total, "failed": failed_total,
+            "out": out_path, "dual": dual}
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:

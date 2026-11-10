@@ -22,7 +22,7 @@ JOBS = {}
 HISTORY = os.path.join(HERE, "历史记录.json")
 SETTINGS = os.path.join(HERE, "设置.json")
 APP_NAME = "PDF翻译专家"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.8"
 
 def load_settings():
     try:
@@ -296,7 +296,11 @@ def add_history(item):
 
 NULLDEV = subprocess.DEVNULL
 
-def run_job(job_id, name, raw, src, tgt, engine):
+class _FallbackLocal(Exception):
+    pass
+
+
+def run_job(job_id, name, raw, src, tgt, engine, resume_page=0):
     job = JOBS[job_id]
     try:
         out_dir = outdir()
@@ -340,6 +344,13 @@ def run_job(job_id, name, raw, src, tgt, engine):
                                     "。可点「用本地引擎重译」——学术论文用本地引擎在本项目实测："
                                     "兼容区汉字 0、引用保留 0.96。"})
             job["truncated"] = trunc
+            if job.get("stopping"):
+                job.update({"stage": "已停止", "percent": job.get("percent", 0),
+                            "out": mono, "dual": dual, "stopped": True})
+                add_history({"name": name, "out": mono, "dual": dual,
+                             "folder": os.path.basename(tgt_dir), "engine": "已停止",
+                             "time": time.strftime("%Y-%m-%d %H:%M")})
+                return
             job.update({"stage": "done", "percent": 100, "out": mono, "dual": dual,
                         "folder": os.path.basename(tgt_dir),
                         "engine_used": res.get("engine_used", job.get("engine_label", "")),
@@ -403,22 +414,48 @@ def run_job(job_id, name, raw, src, tgt, engine):
                         job.update({"stage": "通道失败，尝试下一个", "percent": 4,
                                     "note": "BabelDOC(%s) 失败：%s" % (svc, str(e)[:150])})
                 if explicit:
-                    job.update({"stage": "error", "percent": 0,
-                                "error": "BabelDOC 引擎调用失败：%s\n\n"
-                                         "可在「高级：翻译引擎组件」里点「诊断」查看详细原因，"
-                                         "或改选「自动」让它自动换通道。" % (str(last_err)[:400],)})
-                    return
+                    broken = isinstance(last_err, (ImportError, ModuleNotFoundError)) or \
+                        "No module named" in repr(last_err) or "未产出文件" in str(last_err)
+                    if broken:
+                        log("  → 引擎环境异常，自动改用本地引擎")
+                        job.update({"stage": "引擎异常，改用本地引擎", "percent": 5,
+                                    "note": "BabelDOC 不可用：%s" % str(last_err)[:120]})
+                    else:
+                        job.update({"stage": "error", "percent": 0,
+                                    "error": "BabelDOC 引擎调用失败：%s\n\n"
+                                             "可在「高级：翻译引擎组件」里点「诊断」查看详细原因，"
+                                             "或改选「自动」让它自动换通道。" % (str(last_err)[:400],)})
+                        return
         # local engine fallback
         job.update({"stage": "本地引擎处理", "percent": 5, "service": "local"})
         import pdf_translate
         out_name = "%s_%s.pdf" % (short, tgt)
         out_path = os.path.join(tgt_dir, out_name)
+        ctl = pdf_translate.Control()
+        job["control"] = ctl
+        job["_src"] = tmp
+        job["_out"] = out_path
         st = pdf_translate.translate_pdf(
             tmp, out_path, src, tgt, log=log,
             progress=lambda a, b: job.update({"page": a, "pages": b,
                                               "percent": int(100.0 * a / max(b, 1)),
-                                              "stage": "翻译与回填"}))
+                                              "stage": "翻译与回填"}),
+            control=ctl, start_page=resume_page)
         dual = st.get("dual")
+        if job.get("stopping"):
+            job["resume"] = {"src": tmp, "out": out_path, "page": int(st.get("pages") or job.get("page") or 0),
+                             "name": name, "src_lang": src, "tgt_lang": tgt}
+            job.update({"stage": "已停止", "stopped": True, "engine_used": "本地引擎",
+                        "percent": min(int(job.get("percent") or 0), 99),
+                        "out": os.path.join(os.path.basename(tgt_dir), os.path.basename(out_path)),
+                        "folder": os.path.basename(tgt_dir),
+                        "elapsed": int(time.time() - job.get("t0", time.time()))})
+            add_history({"name": name, "folder": os.path.basename(tgt_dir),
+                         "out": os.path.join(os.path.basename(tgt_dir), os.path.basename(out_path)),
+                         "dual": None, "engine": "已停止（部分）",
+                         "time": time.strftime("%Y-%m-%d %H:%M")})
+            log("stopped %s（已完成页保留）" % name)
+            return
         job.update({"stage": "done", "percent": 100, "engine_used": "本地引擎",
                     "out": os.path.join(os.path.basename(tgt_dir), os.path.basename(out_path)),
                     "dual": (os.path.join(os.path.basename(tgt_dir), os.path.basename(dual))
@@ -762,6 +799,14 @@ function refreshSettings(){
   }).catch(()=>{});
 }
 function openDir(){ fetch('/open',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).catch(()=>{}); }
+function continueJob(id){
+  fetch('/continue', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({id: id})}).then(r=>r.json()).then(j=>{
+      if(j.error){ toast(j.error); return; }
+      toast('已从第 ' + (j.from_page + 1) + ' 页继续');
+      setTimeout(refreshHistory, 1500);
+    }).catch(()=>toast('提交失败'));
+}
 function retryLocal(btn, folder){
   toast('已用本地引擎重新排队，请稍候');
   btn.disabled = true;
@@ -944,7 +989,9 @@ function queue(files){
     const card=document.createElement('div');
     card.className='file';
     card.innerHTML='<div class="top"><div class="nm">'+escapeHtml(f.name)+'</div><div class="st">排队中</div></div>'+
-      '<div class="bar"><i></i></div><div class="meta"><span class="ph">0%</span><span class="sv"></span></div>';
+      '<div class="bar"><i></i></div><div class="meta"><span class="ph">0%</span><span class="sv"></span></div>' +
+      '<div class="dl" style="margin-top:8px"><button class="btn" style="display:none" data-act="pause">暂停</button>' +
+      '<button class="btn" style="display:none" data-act="stop">停止</button></div>';
     filesBox.prepend(card);
     queueList.push({file:f, card});
   });
@@ -958,23 +1005,35 @@ function pump(){
   const job=queueList.shift();
   if(!job){ running=false; return; }
   running=true;
-  const st=job.card.querySelector('.st'), fill=job.card.querySelector('.bar>i'),
-        ph=job.card.querySelector('.ph'), sv=job.card.querySelector('.sv');
-  st.textContent='读取中';
-  const r=new FileReader();
-  r.onload=()=>{
-    const b64=r.result.split(',')[1];
-    fetch('/translate',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name:job.file.name,data:b64,
-        src:document.getElementById('src').value,
-        tgt:document.getElementById('tgt').value,
-        engine:document.getElementById('engine').value})})
-      .then(x=>x.json()).then(j=>{
-        if(j.error){ st.textContent='失败'; job.card.querySelector('.bar').insertAdjacentHTML('afterend','<div class="err">'+escapeHtml(j.error)+'</div>'); running=false; pump(); return; }
-        poll(j.id, job);
-      }).catch(e=>{ st.textContent='失败'; running=false; pump(); });
+  const st=job.card.querySelector('.st');
+  st.textContent='上传中';
+  const q='?name='+encodeURIComponent(job.file.name)
+        +'&src='+document.getElementById('src').value
+        +'&tgt='+document.getElementById('tgt').value
+        +'&engine='+document.getElementById('engine').value;
+  let done=false;
+  const fail=function(msg){
+    if(done) return; done=true;
+    st.textContent='失败';
+    if(msg) job.card.insertAdjacentHTML('beforeend','<div class="err">'+escapeHtml(msg)+'</div>');
+    running=false; pump();
   };
-  r.readAsDataURL(job.file);
+  // 30 分钟兜底，避免任何情况下卡死队列
+  const watchdog=setTimeout(function(){ fail('上传/请求超时，已跳过该文件'); }, 30*60*1000);
+  fetch('/translate-raw'+q, {method:'POST',
+      headers:{'Content-Type':'application/octet-stream'}, body: job.file})
+    .then(x=>x.json()).then(j=>{
+      if(done) return;
+      clearTimeout(watchdog);
+      if(j.error){ done=true; fail(j.error); return; }
+      done=true;
+      job.card.querySelector('[data-act=stop]').style.display = '';
+      if(j.engine_local !== false && job.engine === 'local'){
+        job.card.querySelector('[data-act=pause]').style.display = '';
+      }
+      bindControls(j.id, job);
+      poll(j.id, job);
+    }).catch(e=>{ clearTimeout(watchdog); fail('请求失败：'+(e && e.message ? e.message : e)); });
 }
 
 const TIPS = [
@@ -995,16 +1054,41 @@ function tipFor(elapsedSec){
   return TIPS[i];
 }
 
+function bindControls(id, job){
+  const card = job.card;
+  const btnPause = card.querySelector('[data-act=pause]');
+  const btnStop = card.querySelector('[data-act=stop]');
+  btnPause.onclick = function(){
+    const paused = btnPause.textContent === '继续';
+    fetch(paused ? '/resume' : '/pause', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: id})}).then(r=>r.json()).then(j=>{
+        if(j.error){ toast(j.error); return; }
+        btnPause.textContent = paused ? '暂停' : '继续';
+        toast(paused ? '已继续' : '已暂停，可点「打开文件夹」查看已完成页');
+      }).catch(()=>toast('操作失败'));
+  };
+  btnStop.onclick = function(){
+    const isLocal = (job.engine === 'local') || !!job.card.querySelector('[data-act=pause]').style.display === '';
+    const canPause = job.card.querySelector('[data-act=pause]').style.display !== 'none';
+    const msg = canPause
+      ? '停止当前任务？\n\n· 已完成的页面会保留\n· 停止后可以点「继续翻译」从断点接着翻'
+      : '停止当前任务？\n\n· BabelDOC 引擎停止后只能从头再来，无法续翻\n· 已输出的文件会保留，但内容不完整\n\n建议：想中途停止又能续翻，请改用「本地引擎」。';
+    if(!confirm(msg)) return;
+    fetch('/stop', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: id})}).then(()=>toast('已停止')).catch(()=>{});
+  };
+}
 function poll(id, job){
-  if(job._polling) return;
-  job._polling = true;
+  if(job._timer) clearTimeout(job._timer);
   const st=job.card.querySelector('.st'), fill=job.card.querySelector('.bar>i'),
         ph=job.card.querySelector('.ph'), sv=job.card.querySelector('.sv');
   fetch('/status?id='+id).then(x=>x.json()).then(j=>{
+    job._fails = 0;
     let p=j.percent||0;
     if(!p && j.pages && j.page) p=Math.min(99,Math.round(100*j.page/j.pages));
     fill.style.width=p+'%'; ph.textContent=p+'%';
     if(j.stage==='done'){
+      job.card.querySelectorAll('[data-act]').forEach(function(b){ b.style.display='none'; });
       let mtxt = '';
       if(j.metrics){
         const m = j.metrics;
@@ -1028,13 +1112,35 @@ function poll(id, job){
       running=false; pump(); refreshHistory(); return;
     }
     if(j.stage==='error'){
+      job.card.querySelectorAll('[data-act]').forEach(function(b){ b.style.display='none'; });
       st.textContent='失败';
       job.card.insertAdjacentHTML('beforeend','<div class="err">'+escapeHtml(j.error||'')+'</div>');
       running=false; pump(); return;
     }
+    const st0 = (j.stage || '');
+    const pausedNow = st0.indexOf('已暂停') >= 0;
     const el = Math.round((Date.now() - (job._t0 || (job._t0 = Date.now()))) / 1000);
     if(!job._t0) job._t0 = Date.now();
     const stage = j.stage || '处理中';
+    if(j.stopping || stage === '已停止' || stage.indexOf('正在停止') === 0){
+      if(stage.indexOf('正在停止') === 0){
+        st.textContent = stage;
+        job._timer = setTimeout(()=>poll(id, job), 1500);
+        return;
+      }
+      // 真正停止：收尾一次，隐藏按钮，释放队列
+      fill.style.width = Math.min(p, 99) + '%'; ph.textContent = Math.min(p, 99) + '%';
+      st.textContent = '已停止'; sv.textContent = '已完成页已保留，可在输出文件夹查看';
+      job.card.querySelectorAll('[data-act]').forEach(function(b){ b.style.display = 'none'; });
+      let html = '<div class="dl">';
+      if(j.resume) html += '<button class="btn primary" onclick="continueJob(\'' + id + '\')">继续翻译（从第 ' + (j.resume.page + 1) + ' 页）</button>';
+      if(j.out) html += '<a class="btn" href="/file?name=' + encodeURIComponent(j.out) + '">查看已完成部分</a>';
+      if(j.folder) html += '<button class="btn" onclick="openFolder(\'' + j.folder.replace(/'/g, '') + '\')">打开文件夹</button>';
+      html += '</div>';
+      job.card.insertAdjacentHTML('beforeend', html);
+      running = false; pump(); refreshHistory();
+      return;
+    }
     st.textContent = (stage === '处理中' || stage === '翻译与回填' || stage === '翻译段落')
       ? tipFor(el)
       : stage + ' · ' + tipFor(el);
@@ -1044,7 +1150,18 @@ function poll(id, job){
     if(j.percent) extra.push(j.percent + '%');
     extra.push('已用 ' + el + ' 秒');
     sv.textContent = extra.join(' · ');
-    setTimeout(()=>poll(id,job), 1200);
+    job._timer = setTimeout(()=>poll(id,job), 1200);
+  }).catch(function(){
+    job._fails = (job._fails || 0) + 1;
+    if(job._fails >= 5){
+      const s0 = job.card.querySelector('.st');
+      if(s0) s0.textContent = '与后台失去连接';
+      job.card.insertAdjacentHTML('beforeend',
+        '<div class="err">与后台失去连接，请重启软件后重试（已完成的文件仍在输出目录）</div>');
+      running = false; pump();
+      return;
+    }
+    job._timer = setTimeout(()=>poll(id, job), 2500);
   });
 }
 </script></body></html>"""
@@ -1060,6 +1177,15 @@ def build_html():
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        try:
+            return self._send_inner(code, body, ctype)
+        except Exception:
+            try:
+                return self._send_inner(500, json.dumps({"error": "internal"}, ensure_ascii=False), ctype)
+            except Exception:
+                return
+
+    def _send_inner(self, code, body, ctype="application/json; charset=utf-8"):
         if isinstance(body, str):
             body = body.encode("utf-8")
         self.send_response(code)
@@ -1075,7 +1201,15 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/status":
             q = urllib.parse.parse_qs(u.query)
             jid = (q.get("id") or [""])[0]
-            return self._send(200, json.dumps(JOBS.get(jid, {"stage": "unknown"}), ensure_ascii=False))
+            job = JOBS.get(jid, {"stage": "unknown"})
+            # 只暴露可 JSON 序列化的字段（control 等内部对象不能外发）
+            safe = {}
+            for k, v in job.items():
+                if k.startswith("_") or k in ("control",):
+                    continue
+                if isinstance(v, (str, int, float, bool, list, dict)) or v is None:
+                    safe[k] = v
+            return self._send(200, json.dumps(safe, ensure_ascii=False, default=str))
         if u.path == "/selftest":
             q = urllib.parse.parse_qs(u.query)
             svc = (q.get("service") or ["bing"])[0]
@@ -1125,6 +1259,7 @@ class H(BaseHTTPRequestHandler):
         return self._send(404, "not found", "text/plain")
 
     def do_POST(self):
+        u = urllib.parse.urlparse(self.path)
         if self.path == "/retry-local":
             n = int(self.headers.get("Content-Length") or 0)
             try:
@@ -1175,6 +1310,78 @@ class H(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"path": path}, ensure_ascii=False))
             except Exception as e:
                 return self._send(200, json.dumps({"error": str(e)}, ensure_ascii=False))
+        if self.path == "/continue":
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                _jid = (json.loads(self.rfile.read(n).decode("utf-8")) or {}).get("id") or ""
+            except Exception:
+                _jid = ""
+            job = JOBS.get(_jid) or {}
+            rs = job.get("resume")
+            if not rs:
+                return self._send(200, json.dumps(
+                    {"error": "该任务无法续翻（BabelDOC 引擎或已丢失上下文），请重新上传"},
+                    ensure_ascii=False))
+            try:
+                raw2 = open(rs["src"], "rb").read()
+            except Exception as e:
+                return self._send(200, json.dumps({"error": "源文件已丢失：%r" % (e,)},
+                                                  ensure_ascii=False))
+            new_id = uuid.uuid4().hex[:12]
+            JOBS[new_id] = {"stage": "排队中", "percent": 0, "name": rs["name"],
+                            "t0": time.time(), "page": rs["page"], "pages": 0,
+                            "resuming": True}
+            th = threading.Thread(target=run_job,
+                                  args=(new_id, rs["name"], raw2, rs["src_lang"],
+                                        rs["tgt_lang"], "local", rs["page"]))
+            th.daemon = True
+            th.start()
+            return self._send(200, json.dumps({"ok": True, "id": new_id,
+                                               "from_page": rs["page"]},
+                                              ensure_ascii=False))
+        if self.path in ("/pause", "/resume", "/stop"):
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                jid = (json.loads(self.rfile.read(n).decode("utf-8")) or {}).get("id") or ""
+            except Exception:
+                jid = ""
+            job = JOBS.get(jid)
+            if not job:
+                return self._send(200, json.dumps({"error": "任务不存在"}, ensure_ascii=False))
+            ctl = job.get("control")
+            if self.path == "/pause":
+                if not ctl:
+                    return self._send(200, json.dumps(
+                        {"error": "当前引擎不支持暂停；可点「停止」，或改用本地引擎（支持暂停/继续）"},
+                        ensure_ascii=False))
+                ctl.pause()
+                job["stage"] = "已暂停（可打开输出文件夹查看已完成页）"
+                return self._send(200, json.dumps({"ok": True, "paused": True}, ensure_ascii=False))
+            if self.path == "/resume":
+                if ctl:
+                    ctl.resume()
+                    job["stage"] = "继续中"
+                return self._send(200, json.dumps({"ok": True}, ensure_ascii=False))
+            if self.path == "/stop":
+                job["stopping"] = True
+                if job.get("_out"):
+                    job["resume"] = {"src": job.get("_src"), "out": job.get("_out"),
+                                     "page": int(job.get("page") or 0),
+                                     "name": job.get("name") or "document.pdf",
+                                     "src_lang": "en", "tgt_lang": "zh"}
+                if ctl:
+                    ctl.cancel()
+                job.pop("control", None)
+                killed = False
+                try:
+                    import pdf_engine_babeldoc as _be
+                    killed = _be.kill_current()
+                except Exception:
+                    pass
+                job["stage"] = "已停止" if killed else "正在停止（等当前页结束）"
+                return self._send(200, json.dumps({"ok": True, "killed": killed},
+                                                  ensure_ascii=False))
+                return self._send(200, json.dumps({"ok": True}, ensure_ascii=False))
         if self.path == "/engine/install":
             n = int(self.headers.get("Content-Length") or 0)
             kind = "babeldoc"
@@ -1218,6 +1425,38 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._send(200, json.dumps({"error": str(e)}))
             return self._send(200, json.dumps({"outdir": outdir()}, ensure_ascii=False))
+        if u.path == "/translate-raw":
+            q = urllib.parse.parse_qs(u.query)
+            name = (q.get("name") or ["document.pdf"])[0]
+            src = (q.get("src") or ["en"])[0]
+            tgt = (q.get("tgt") or ["zh"])[0]
+            engine = (q.get("engine") or ["auto"])[0]
+            n = int(self.headers.get("Content-Length") or 0)
+            os.makedirs(UPLOADS, exist_ok=True)
+            tmp_path = os.path.join(UPLOADS, "_upload_%s.pdf" % uuid.uuid4().hex[:8])
+            try:
+                left = n
+                with open(tmp_path, "wb") as f:
+                    while left > 0:
+                        chunk = self.rfile.read(min(1 << 20, left))
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        left -= len(chunk)
+                raw = open(tmp_path, "rb").read()
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+            job_id = uuid.uuid4().hex[:12]
+            JOBS[job_id] = {"stage": "排队中", "percent": 0, "name": name,
+                            "t0": time.time(), "page": 0, "pages": 0}
+            th = threading.Thread(target=run_job, args=(job_id, name, raw, src, tgt, engine))
+            th.daemon = True
+            th.start()
+            return self._send(200, json.dumps({"ok": True, "id": job_id, "name": name,
+                                               "engine": engine}, ensure_ascii=False))
         if self.path != "/translate":
             return self._send(404, "no", "text/plain")
         n = int(self.headers.get("Content-Length") or 0)

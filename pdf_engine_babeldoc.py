@@ -335,6 +335,28 @@ def _ensure_fonts(log=print):
         return False
 
 
+_CURRENT_PROC = {"p": None}
+
+
+def kill_current():
+    """停止正在跑的 BabelDOC 子进程（用于「停止」按钮）。"""
+    p = _CURRENT_PROC.get("p")
+    if p and p.poll() is None:
+        try:
+            import subprocess as _sp
+            _sp.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
+                    capture_output=True,
+                    creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        _CURRENT_PROC["p"] = None
+        return True
+    return False
+
+
 def translate(src_pdf, out_dir, src="en", tgt="zh", base_name=None, log=print, progress=None, service="bing"):
     if not available():
         raise RuntimeError("PDF_Translator 未安装：%s" % ROOT)
@@ -371,6 +393,7 @@ def translate(src_pdf, out_dir, src="en", tgt="zh", base_name=None, log=print, p
         proc = subprocess.Popen(cmd, cwd=_workdir(),
                                 stdout=fh, stderr=subprocess.STDOUT, env=env,
                                 creationflags=flags)
+        _CURRENT_PROC["p"] = proc
         pos = 0
         acc = ""
         while proc.poll() is None:
